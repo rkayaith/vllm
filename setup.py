@@ -20,7 +20,7 @@ from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 from setuptools_rust.build import build_rust
 from setuptools_scm import get_version
-from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
+from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME as TORCH_ROCM_HOME
 
 
 def load_module_from_path(module_name, path):
@@ -38,6 +38,23 @@ PRECOMPILED_RUST_FRONTEND_PATH = ROOT_DIR / "vllm" / "vllm-rs"
 # setuptools-rust installs PyO3 artifacts as `<module>.<ext-suffix>`, where the
 # suffix ends with `.so` on Linux and macOS alike (e.g. `_rust_foo.abi3.so`).
 PRECOMPILED_RUST_EXTENSION_MEMBER_REGEX = re.compile(r"vllm/_rust_[^/]*\.so$")
+
+
+def get_rocm_home() -> str | None:
+    try:
+        from rocm_sdk import _devel
+    except ModuleNotFoundError:
+        return TORCH_ROCM_HOME
+
+    rocm_home = _devel.get_devel_root()
+    if not (rocm_home / "lib" / "libamdhip64.so").exists():
+        raise FileNotFoundError(
+            f"TheRock ROCm devel root is incomplete: {rocm_home}"
+        )
+    return str(rocm_home)
+
+
+ROCM_HOME = get_rocm_home()
 
 # cannot import envs directly because it depends on vllm,
 #  which is not installed yet
