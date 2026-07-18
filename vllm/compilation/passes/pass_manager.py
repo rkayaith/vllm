@@ -28,6 +28,9 @@ if rocm_aiter_ops.is_enabled():
         RocmAiterSiluMulFp8GroupQuantFusionPass,
         RocmAiterTritonAddRMSNormPadFusionPass,
     )
+    from .fusion.rocm_aiter_residual_rmsnorm_requant_mm_fusion import (
+        RocmAiterHipBMMResidualRMSNormRequantMMFusionPass,
+    )
 
 if current_platform.is_cuda_alike() or current_platform.is_xpu():
     from .fusion.sequence_parallelism import SequenceParallelismPass
@@ -161,6 +164,13 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
 
             if self.pass_config.fuse_norm_quant:
                 if rocm_aiter_ops.is_enabled():
+                    if rocm_aiter_ops.is_linear_hipbmm_enabled():
+                        # Run the long GEMM/RMSNorm/requant/GEMM fusion before
+                        # the existing RMSNorm+quant fusions, since they match
+                        # and replace the overlapping RMSNorm/requant suffix.
+                        self.passes += [
+                            RocmAiterHipBMMResidualRMSNormRequantMMFusionPass(config),
+                        ]
                     self.passes += [
                         RocmAiterRMSNormQuantFusionPass(config),
                     ]

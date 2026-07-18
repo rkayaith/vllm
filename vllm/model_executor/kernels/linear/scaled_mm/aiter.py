@@ -228,11 +228,11 @@ class AiterHipbMMPerTokenFp8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
                 "and `VLLM_ROCM_USE_AITER_LINEAR_HIPBMM=1`.",
             )
         try:
-            import aiter  # noqa: F401
+            from aiter.ops import gradlib as aiter_gradlib
         except Exception:
             return False, "requires aiter library to be installed."
 
-        if not hasattr(aiter, "hipb_mm"):
+        if not hasattr(aiter_gradlib, "hipb_mm"):
             return False, "requires aiter hipb_mm support."
 
         return True, None

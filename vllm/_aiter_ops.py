@@ -31,11 +31,11 @@ _HIPB_MM_INITIALIZED_DEVICES: set[int] = set()
 
 
 def _ensure_hipb_mm_extension_initialized() -> None:
-    import aiter
+    from aiter.ops.gradlib import hipb_create_extension
 
     device = torch.accelerator.current_device_index()
     if device not in _HIPB_MM_INITIALIZED_DEVICES:
-        aiter.hipb_create_extension()
+        hipb_create_extension()
         _HIPB_MM_INITIALIZED_DEVICES.add(device)
 
 
@@ -665,7 +665,7 @@ def _rocm_aiter_hipb_mm_fp8_impl(
     bias: torch.Tensor | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    from aiter import hipb_mm
+    from aiter.ops.gradlib import hipb_mm
 
     _ensure_hipb_mm_extension_initialized()
     return hipb_mm(
@@ -692,6 +692,61 @@ def _rocm_aiter_hipb_mm_fp8_fake(
     m = A.shape[0]
     n = B.shape[1]
     return torch.empty(m, n, dtype=output_dtype, device=A.device)
+
+
+def _rocm_aiter_hipb_mm_residual_rmsnorm_requant_mm_impl(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    residual: torch.Tensor,
+    rms_weight: torch.Tensor,
+    quant_scale: torch.Tensor,
+    next_B: torch.Tensor,
+    next_Bs: torch.Tensor,
+    epsilon: float,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Call AITER's fused GEMM/residual RMSNorm/requant/GEMM launcher."""
+    from aiter.ops.gradlib import hipb_mm_residual_rmsnorm_mm
+
+    _ensure_hipb_mm_extension_initialized()
+    return hipb_mm_residual_rmsnorm_mm(
+        A,
+        B,
+        residual,
+        rms_weight,
+        next_B,
+        As,
+        Bs,
+        quant_scale,
+        # Static per-tensor quant returns the caller-provided scale, and the
+        # trailing GEMM consumes that same activation scale.
+        quant_scale,
+        next_Bs,
+        epsilon,
+    )
+
+
+def _rocm_aiter_hipb_mm_residual_rmsnorm_requant_mm_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    residual: torch.Tensor,
+    rms_weight: torch.Tensor,
+    quant_scale: torch.Tensor,
+    next_B: torch.Tensor,
+    next_Bs: torch.Tensor,
+    epsilon: float,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    next_output = torch.empty(
+        (*residual.shape[:-1], next_B.shape[1]),
+        dtype=output_dtype,
+        device=A.device,
+    )
+    return next_output, torch.empty_like(residual)
 
 
 def _rocm_aiter_triton_gemm_a8w8_blockscale_impl(
@@ -1914,6 +1969,12 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_hipb_mm_residual_rmsnorm_requant_mm",
+                op_func=_rocm_aiter_hipb_mm_residual_rmsnorm_requant_mm_impl,
+                fake_impl=_rocm_aiter_hipb_mm_residual_rmsnorm_requant_mm_fake,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_triton_gemm_a8w8_blockscale",
                 op_func=_rocm_aiter_triton_gemm_a8w8_blockscale_impl,
                 fake_impl=_rocm_aiter_triton_gemm_a8w8_blockscale_fake,
@@ -2148,6 +2209,38 @@ class rocm_aiter_ops:
         output_dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_hipb_mm_fp8(A, B, As, Bs, bias, output_dtype)
+
+    @staticmethod
+    def get_hipb_mm_residual_rmsnorm_requant_mm_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_hipb_mm_residual_rmsnorm_requant_mm.default
+
+    @staticmethod
+    def hipb_mm_residual_rmsnorm_requant_mm(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        residual: torch.Tensor,
+        rms_weight: torch.Tensor,
+        quant_scale: torch.Tensor,
+        next_B: torch.Tensor,
+        next_Bs: torch.Tensor,
+        epsilon: float,
+        output_dtype: torch.dtype = torch.bfloat16,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.vllm.rocm_aiter_hipb_mm_residual_rmsnorm_requant_mm(
+            A,
+            B,
+            As,
+            Bs,
+            residual,
+            rms_weight,
+            quant_scale,
+            next_B,
+            next_Bs,
+            epsilon,
+            output_dtype,
+        )
 
     @staticmethod
     def triton_gemm_a8w8_blockscale(
