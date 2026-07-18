@@ -39,8 +39,12 @@ def test_noop_elimination(dtype, num_tokens, hidden_size, buffer_size):
             z = y.reshape(-1, 4096)
             # No-op reshape
             a = z.reshape(-1, 4096)
+            # No-op method-style view
+            a = a.view(-1, 4096)
             # Final reshape that should remain
             b = a.reshape(-1, 128, 32)
+            # No-op narrow matching the ROCm scaled-mm wrapper shape.
+            b = torch.narrow(b, 0, 0, b.shape[0])
             # No-op slice
             c = b[0 : b.shape[0]]
             # The pass should replace the result of this op with `c`.
@@ -83,6 +87,9 @@ def test_noop_elimination(dtype, num_tokens, hidden_size, buffer_size):
         assert backend.op_count(torch.ops.aten.reshape.default) == 1
         assert backend.op_count(torch.ops.aten.slice.Tensor) == 1
         assert backend.op_count(torch.ops.aten.slice_scatter.default) == 0
+        assert sum(
+            1 for node in backend.graph_post_pass.nodes if node.target == torch.narrow
+        ) == 0
 
 
 def test_non_noop_slice_preserved():

@@ -17,7 +17,8 @@ logger = init_logger(__name__)
 
 class NoOpEliminationPass(VllmInductorPass):
     """
-    This is an inductor pass that removes redundant reshape/slice operations.
+    This is an inductor pass that removes redundant reshape/view/slice/narrow
+    operations.
     It is required for RMSNorm-quant fusion to work properly.
     That's because apply_fp8_linear adds a reshape, which is redundant
     in the 2D-case. Additionally, torch internal no-op elimination pass does
@@ -26,8 +27,8 @@ class NoOpEliminationPass(VllmInductorPass):
     Cases handled:
       1. A chain of reshapes is equivalent to the last reshape called on the
       base tensor (input of the first reshape).
-      2. A reshape that produces the shape of the input is redundant
-      3. A slice that produces the shape of the input is redundant
+      2. A reshape/view that produces the shape of the input is redundant
+      3. A slice/narrow that produces the shape of the input is redundant
 
     Example graph 1:
     mul_1: "f16[s0, 4096]" = ...
@@ -69,11 +70,13 @@ class NoOpEliminationPass(VllmInductorPass):
         count = 0
         # Remove no-op reshapes/views:
         for node in graph.nodes:
-            if is_func(node, torch.ops.aten.reshape.default):
+            if self.is_view_or_reshape(node):
                 # Case 1: rewrite reshape chains to reshapes on the base tensor
                 input = node.args[0]
                 # If the input is a reshape, rebind to that node
-                if is_func(input, torch.ops.aten.reshape.default):
+                if isinstance(input, torch.fx.Node) and self.is_view_or_reshape(
+                    input
+                ):
                     # The new input is guaranteed not to be a reshape,
                     # because we process nodes in order
                     node.update_arg(0, input.args[0])
@@ -82,10 +85,10 @@ class NoOpEliminationPass(VllmInductorPass):
                         count += 1
 
             # remove reshape/slice if it produces the original shape
-            if is_func(node, torch.ops.aten.reshape.default) or is_func(
-                node, torch.ops.aten.slice.Tensor
-            ):
+            if self.is_view_or_reshape(node) or self.is_slice_or_narrow(node):
                 input = node.args[0]
+                if not isinstance(input, torch.fx.Node):
+                    continue
                 input_shape = input.meta["val"].shape
                 output_shape = node.meta["val"].shape
                 if self.all_dims_equivalent(input_shape, output_shape):
@@ -102,9 +105,23 @@ class NoOpEliminationPass(VllmInductorPass):
                     graph.erase_node(node)
                     count += 1
 
-        logger.debug("Removed %s no-op reshapes and slices", count)
+        logger.debug("Removed %s no-op reshapes/views and slices/narrows", count)
 
     # ---------------------- Shape comparison helpers ----------------------
+    @staticmethod
+    def is_view_or_reshape(node: torch.fx.Node) -> bool:
+        return (
+            is_func(node, torch.ops.aten.reshape.default)
+            or is_func(node, torch.ops.aten.view.default)
+            or (node.op == "call_method" and node.target in {"reshape", "view"})
+        )
+
+    @staticmethod
+    def is_slice_or_narrow(node: torch.fx.Node) -> bool:
+        return is_func(node, torch.ops.aten.slice.Tensor) or is_func(
+            node, torch.narrow
+        )
+
     def dims_equivalent(self, dim: int | SymInt, i_dim: int | SymInt) -> bool:
         """
         This function checks if two dimensions are equivalent.
