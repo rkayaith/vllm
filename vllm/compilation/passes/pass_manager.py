@@ -28,6 +28,9 @@ if rocm_aiter_ops.is_enabled():
         RocmAiterSiluMulFp8GroupQuantFusionPass,
         RocmAiterTritonAddRMSNormPadFusionPass,
     )
+    from .fusion.rocm_mxfp8_gemm_rmsnorm_quant_fusion import (
+        RocmMxfp8GemmRMSNormQuantFusionPass,
+    )
 
 if current_platform.is_cuda_alike() or current_platform.is_xpu():
     from .fusion.sequence_parallelism import SequenceParallelismPass
@@ -163,6 +166,7 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
             if self.pass_config.fuse_norm_quant:
                 if rocm_aiter_ops.is_enabled():
                     self.passes += [
+                        RocmMxfp8GemmRMSNormQuantFusionPass(config),
                         RocmAiterRMSNormQuantFusionPass(config),
                     ]
                 self.passes += [RMSNormQuantFusionPass(config)]
