@@ -1053,6 +1053,8 @@ class RoutedExperts(PluggableLayer):
         topk_ids: torch.Tensor,
         shared_experts: "SharedExperts | None" = None,
         shared_experts_input: torch.Tensor | None = None,
+        prequantized_hidden_states: torch.Tensor | None = None,
+        prequantized_hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Execute routed experts using the quantization method's apply function.
@@ -1072,8 +1074,34 @@ class RoutedExperts(PluggableLayer):
             Output tensor from routed experts
         """
         assert not self.quant_method.is_monolithic
+        assert (prequantized_hidden_states is None) == (
+            prequantized_hidden_states_scale is None
+        )
 
-        # Modular kernels use pre-computed routing
+        if prequantized_hidden_states is not None:
+            # Both migrated quant methods and the legacy modular wrapper expose
+            # the selected implementation through ``moe_kernel``. Call that
+            # common interface directly because only it accepts the separately
+            # quantized activation and scale.
+            moe_kernel = self.quant_method.moe_kernel
+            assert moe_kernel is not None
+            return moe_kernel.apply(
+                hidden_states=x,
+                w1=self.w13_weight,
+                w2=self.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=self.activation,
+                global_num_experts=self.global_num_experts,
+                expert_map=self.expert_map,
+                apply_router_weight_on_input=self.apply_router_weight_on_input,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+                prequantized_hidden_states=prequantized_hidden_states,
+                prequantized_hidden_states_scale=prequantized_hidden_states_scale,
+            )
+
+        # Modular kernels use pre-computed routing.
         return self.quant_method.apply(
             layer=self,
             x=x,

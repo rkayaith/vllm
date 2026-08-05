@@ -22,14 +22,14 @@ if rocm_aiter_ops.is_enabled():
     from .fusion.allreduce_rms_fusion import (
         RocmAiterAllReduceFusionPass,
     )
+    from .fusion.rocm_aiter_blockscale_gemm_rmsnorm_quant_fusion import (
+        RocmAiterBlockscaleGemmRMSNormQuantFusionPass,
+    )
     from .fusion.rocm_aiter_fusion import (
         MLADualRMSNormFusionPass,
         RocmAiterRMSNormQuantFusionPass,
         RocmAiterSiluMulFp8GroupQuantFusionPass,
         RocmAiterTritonAddRMSNormPadFusionPass,
-    )
-    from .fusion.rocm_aiter_residual_rmsnorm_requant_mm_fusion import (
-        RocmAiterHipBMMResidualRMSNormRequantMMFusionPass,
     )
 
 if current_platform.is_cuda_alike() or current_platform.is_xpu():
@@ -164,14 +164,10 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
 
             if self.pass_config.fuse_norm_quant:
                 if rocm_aiter_ops.is_enabled():
-                    if rocm_aiter_ops.is_linear_hipbmm_enabled():
-                        # Run the long GEMM/RMSNorm/requant/GEMM fusion before
-                        # the existing RMSNorm+quant fusions, since they match
-                        # and replace the overlapping RMSNorm/requant suffix.
-                        self.passes += [
-                            RocmAiterHipBMMResidualRMSNormRequantMMFusionPass(config),
-                        ]
+                    # Match the longer Qwen GEMM/RMSNorm/quant region before
+                    # the existing RMSNorm+quant pass consumes its suffix.
                     self.passes += [
+                        RocmAiterBlockscaleGemmRMSNormQuantFusionPass(config),
                         RocmAiterRMSNormQuantFusionPass(config),
                     ]
                 self.passes += [RMSNormQuantFusionPass(config)]

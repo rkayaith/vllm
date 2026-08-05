@@ -23,6 +23,7 @@ from .fx_utils import is_func
 from .inductor_pass import InductorPass, enable_fake_mode
 
 logger = init_logger(__name__)
+PassT = TypeVar("PassT", bound="VllmInductorPass")
 
 
 @dataclass
@@ -56,10 +57,10 @@ class VllmInductorPass(InductorPass):
 
     @staticmethod
     def time_and_log(
-        call_fn: Callable[["VllmInductorPass", torch.fx.Graph], None],
-    ) -> Callable[["VllmInductorPass", torch.fx.Graph], None]:
+        call_fn: Callable[[PassT, torch.fx.Graph], None],
+    ) -> Callable[[PassT, torch.fx.Graph], None]:
         @functools.wraps(call_fn)
-        def wrapped(self: VllmInductorPass, graph: torch.fx.Graph) -> None:
+        def wrapped(self: PassT, graph: torch.fx.Graph) -> None:
             self.begin()
             self.dump_graph(graph, "before")
             call_fn(self, graph)

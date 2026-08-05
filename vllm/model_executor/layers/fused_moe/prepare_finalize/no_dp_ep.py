@@ -38,6 +38,11 @@ def _quantize_input(
 
 
 class MoEPrepareAndFinalizeNoDPEPModular(mk.FusedMoEPrepareAndFinalizeModular):
+    def supports_prequantized_input(self) -> bool:
+        # This implementation does not dispatch or permute activations before
+        # the expert kernel, so a caller may perform its input quantization.
+        return True
+
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard

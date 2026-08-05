@@ -245,6 +245,15 @@ class FusedMoEPrepareAndFinalize(ABC):
         """
         return False
 
+    def supports_prequantized_input(self) -> bool:
+        """Whether ``prepare`` can be bypassed for an already quantized input.
+
+        This is deliberately false for communication-backed prepare/finalize
+        implementations: those implementations may need to dispatch or
+        rearrange activations in addition to quantizing them.
+        """
+        return False
+
     def on_commit(self) -> None:
         """
         Runs after this prepare/finalize has been committed to the active
@@ -516,6 +525,11 @@ class FusedMoEExperts(ABC):
 
         Sample subclasses that override are AITER and FlashInfer CUTLASS.
         """
+        return False
+
+    @property
+    def supports_prequantized_inputs(self) -> bool:
+        """Whether the expert kernel accepts an FP8 input and its scale."""
         return False
 
     @staticmethod
@@ -1354,6 +1368,8 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool = False,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        prequantized_hidden_states: torch.Tensor | None = None,
+        prequantized_hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         This function computes a Mixture of Experts (MoE) layer using two sets
@@ -1389,14 +1405,29 @@ class FusedMoEKernelModularImpl:
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
-        a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            global_num_experts,
-            expert_map,
-            apply_router_weight_on_input,
-        )
+        if prequantized_hidden_states is None:
+            assert prequantized_hidden_states_scale is None
+            a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                global_num_experts,
+                expert_map,
+                apply_router_weight_on_input,
+            )
+        else:
+            # Hoisted quantization is only safe when prepare() has no dispatch,
+            # permutation, or router-weight work of its own. The capability
+            # checks are intentionally explicit so an all-to-all backend cannot
+            # silently consume an activation in the wrong layout.
+            assert self.prepare_finalize.supports_prequantized_input()
+            assert self.fused_experts.supports_prequantized_inputs
+            assert not apply_router_weight_on_input
+            assert prequantized_hidden_states_scale is not None
+            assert prequantized_hidden_states.shape == hidden_states.shape
+            a1q = prequantized_hidden_states
+            a1q_scale = prequantized_hidden_states_scale
+            expert_tokens_meta = None
 
         fused_out = self._fused_experts(
             in_dtype=hidden_states.dtype,
@@ -1568,6 +1599,38 @@ class FusedMoEKernel:
         """
         return self.prepare_finalize.output_is_reduced()
 
+    def maybe_prequantize_input(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Expose the AITER 1x128 input quantization before the opaque MoE op.
+
+        Qwen uses the same normalized BF16 activation for its router and its
+        block-scaled experts. Keeping the BF16 tensor for routing while passing
+        this separately quantized pair to AITER makes the requant node visible
+        to post-grad fusion without changing the MoE output contract.
+        """
+        if not isinstance(self.impl, FusedMoEKernelModularImpl):
+            return None
+        if not self.prepare_finalize.supports_prequantized_input():
+            return None
+        if not self.fused_experts.supports_prequantized_inputs:
+            return None
+
+        quant_config = self.fused_experts.quant_config
+        block_shape = quant_config.block_shape
+        if (
+            not quant_config.use_fp8_w8a8
+            or block_shape != [128, 128]
+            or quant_config.a1_scale is not None
+            or hidden_states.ndim != 2
+            or hidden_states.shape[-1] % 128 != 0
+        ):
+            return None
+
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        return rocm_aiter_ops.group_fp8_quant(hidden_states, 128)
+
     def apply_monolithic(
         self,
         hidden_states: torch.Tensor,
@@ -1613,6 +1676,8 @@ class FusedMoEKernel:
         apply_router_weight_on_input: bool,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        prequantized_hidden_states: torch.Tensor | None = None,
+        prequantized_hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
         return self.impl.apply(
@@ -1627,4 +1692,6 @@ class FusedMoEKernel:
             apply_router_weight_on_input=apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            prequantized_hidden_states=prequantized_hidden_states,
+            prequantized_hidden_states_scale=prequantized_hidden_states_scale,
         )

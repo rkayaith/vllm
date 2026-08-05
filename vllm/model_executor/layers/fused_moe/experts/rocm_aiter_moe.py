@@ -393,6 +393,12 @@ def rocm_aiter_fused_experts(
 
 class AiterExperts(mk.FusedMoEExpertsModular):
     @property
+    def supports_prequantized_inputs(self) -> bool:
+        # ``rocm_aiter_fused_experts`` accepts FP8 activations plus their
+        # per-group scales and skips its internal activation quantization.
+        return True
+
+    @property
     def expects_unquantized_inputs(self) -> bool:
         # When paired with MoRI, the prepare/finalize handles FP8
         # quantization during dispatch to reduce network traffic,
@@ -511,6 +517,21 @@ class AiterExperts(mk.FusedMoEExpertsModular):
 
         if expert_tokens_meta is not None:
             num_local_tokens = expert_tokens_meta.expert_num_tokens
+        elif (
+            a1q_scale is not None
+            and self.quant_config.block_shape == [128, 128]
+            and hidden_states.dtype == self.quant_config.quant_dtype
+        ):
+            # AITER transposes externally produced 1x128 scales before its MoE
+            # GEMM and requires the number of valid rows as a device tensor.
+            # Prequantization is only enabled for the no-dispatch path, so every
+            # row in the input is valid.
+            num_local_tokens = torch.full(
+                (1,),
+                hidden_states.shape[0],
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
         else:
             num_local_tokens = None
 

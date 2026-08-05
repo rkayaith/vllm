@@ -122,6 +122,8 @@ def _moe_forward(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    prequantized_hidden_states: torch.Tensor | None,
+    prequantized_hidden_states_scale: torch.Tensor | None,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     return layer._forward_impl(
@@ -129,6 +131,8 @@ def _moe_forward(
         router_logits,
         shared_experts_input,
         input_ids,
+        prequantized_hidden_states,
+        prequantized_hidden_states_scale,
     )
 
 
@@ -139,7 +143,10 @@ def _moe_forward_fake(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    prequantized_hidden_states: torch.Tensor | None,
+    prequantized_hidden_states_scale: torch.Tensor | None,
 ) -> torch.Tensor:
+    del prequantized_hidden_states, prequantized_hidden_states_scale
     # `hidden_dim_unpadded > 0` only on the TRT-LLM MXFP4 path, where the
     # real kernel writes narrower than `hidden_states.shape[-1]`. Plumbed
     # as an op arg (not peeked from the layer registry) to keep the fake
@@ -156,6 +163,8 @@ def _moe_forward_shared(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    prequantized_hidden_states: torch.Tensor | None,
+    prequantized_hidden_states_scale: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     return layer._forward_impl(
@@ -163,6 +172,8 @@ def _moe_forward_shared(
         router_logits,
         shared_experts_input,
         input_ids,
+        prequantized_hidden_states,
+        prequantized_hidden_states_scale,
     )
 
 
@@ -173,7 +184,10 @@ def _moe_forward_shared_fake(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    prequantized_hidden_states: torch.Tensor | None,
+    prequantized_hidden_states_scale: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    del prequantized_hidden_states, prequantized_hidden_states_scale
     # `fused_out`: see `_moe_forward_fake` for hidden_dim_unpadded semantics.
     # `shared_out`: matches `shared_experts_input` if provided (latent MoE),
     # else `hidden_states`.
@@ -535,6 +549,8 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
+        prequantized_hidden_states: torch.Tensor | None = None,
+        prequantized_hidden_states_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -568,6 +584,8 @@ class MoERunner(MoERunnerInterface):
                 topk_ids=topk_ids,
                 shared_experts=self._shared_experts,
                 shared_experts_input=shared_experts_input,
+                prequantized_hidden_states=prequantized_hidden_states,
+                prequantized_hidden_states_scale=prequantized_hidden_states_scale,
             )
 
         self._maybe_apply_shared_experts(
@@ -579,6 +597,25 @@ class MoERunner(MoERunnerInterface):
             self._shared_experts.output if self._shared_experts is not None else None,
             fused_out,
         )
+
+    def _maybe_prequantize_input(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        # Quantization cannot be hoisted across runner-level dispatch because
+        # the dispatched activation and scale layouts would no longer agree.
+        if self.do_naive_dispatch_combine or self.moe_config.pcp_size > 1:
+            return None
+
+        self.routed_experts._ensure_moe_quant_config_init()
+        quant_method = self.routed_experts.quant_method
+        # Quant methods that have completed the modular-kernel migration own
+        # their kernel directly. Older methods reach the same interface through
+        # FusedMoEModularMethod. Use the common kernel attribute so both paths
+        # can expose a supported input quantization.
+        moe_kernel = quant_method.moe_kernel
+        if moe_kernel is None:
+            return None
+        return moe_kernel.maybe_prequantize_input(hidden_states)
 
     def _sequence_parallel_context(self):
         """Return a context manager for sequence-parallel token
@@ -667,6 +704,17 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
+        # AITER's block-scaled MoE normally quantizes its BF16 input inside
+        # the opaque ``moe_forward`` custom op. Hoist only the supported
+        # no-dispatch 1x128 case so the post-grad graph can see and fuse that
+        # requantization. The original BF16 value remains the router input.
+        prequantized = self._maybe_prequantize_input(hidden_states)
+        if prequantized is None:
+            prequantized_hidden_states = None
+            prequantized_hidden_states_scale = None
+        else:
+            prequantized_hidden_states, prequantized_hidden_states_scale = prequantized
+
         result = self._forward_entry(
             hidden_states,
             router_logits,
@@ -676,6 +724,8 @@ class MoERunner(MoERunnerInterface):
             self.moe_config.hidden_dim_unpadded
             if self._quant_method.has_unpadded_output
             else 0,
+            prequantized_hidden_states,
+            prequantized_hidden_states_scale,
         )
 
         #
@@ -780,6 +830,8 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
+        prequantized_hidden_states: torch.Tensor | None = None,
+        prequantized_hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Entry point called by the custom op to run the MoE computation.
 
@@ -817,12 +869,17 @@ class MoERunner(MoERunnerInterface):
                 hidden_states,
                 router_logits,
             )
+            assert prequantized_hidden_states is None or not (
+                self.do_naive_dispatch_combine or self.moe_config.pcp_size > 1
+            )
 
             shared_output, hidden_states = self._apply_quant_method(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 shared_experts_input=shared_experts_input,
                 input_ids=input_ids,
+                prequantized_hidden_states=prequantized_hidden_states,
+                prequantized_hidden_states_scale=prequantized_hidden_states_scale,
             )
 
             return self._maybe_combine(
