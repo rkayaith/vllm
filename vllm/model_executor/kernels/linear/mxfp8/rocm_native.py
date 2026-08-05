@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
@@ -80,19 +81,20 @@ def _mxfp8_linear_kernel(
     )
 
 
-def _mxfp8_dot_scaled_linear(
-    x: torch.Tensor,  # [M, K] bf16/fp16
+def _rocm_mxfp8_dot_scaled_mm_impl(
+    x: torch.Tensor,  # [M, K] fp8 e4m3
+    x_scale: torch.Tensor,  # [M, K//32] uint8 (E8M0)
     w: torch.Tensor,  # [N, K] fp8 e4m3
     w_scale: torch.Tensor,  # [N, K//32] uint8 (E8M0)
+    output_dtype: torch.dtype,
 ) -> torch.Tensor:
     M, K = x.shape
     N = w.shape[0]
-    x_q, x_scale = mxfp8_e4m3_quantize(x)
-    out = torch.empty((M, N), dtype=x.dtype, device=x.device)
+    out = torch.empty((M, N), dtype=output_dtype, device=x.device)
     BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages = _select_cfg(M, N, K)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _mxfp8_linear_kernel[grid](
-        x_q,
+        x,
         x_scale,
         w,
         w_scale,
@@ -100,8 +102,8 @@ def _mxfp8_dot_scaled_linear(
         M,
         N,
         K,
-        x_q.stride(0),
-        x_q.stride(1),
+        x.stride(0),
+        x.stride(1),
         x_scale.stride(0),
         x_scale.stride(1),
         w.stride(0),
@@ -117,6 +119,43 @@ def _mxfp8_dot_scaled_linear(
         num_stages=num_stages,
     )
     return out
+
+
+def _rocm_mxfp8_dot_scaled_mm_fake(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    del x_scale, w_scale
+    return torch.empty(
+        (x.shape[0], w.shape[0]),
+        dtype=output_dtype,
+        device=x.device,
+    )
+
+
+direct_register_custom_op(
+    op_name="rocm_mxfp8_dot_scaled_mm",
+    op_func=_rocm_mxfp8_dot_scaled_mm_impl,
+    fake_impl=_rocm_mxfp8_dot_scaled_mm_fake,
+)
+
+
+def _mxfp8_dot_scaled_linear(
+    x: torch.Tensor,  # [M, K] bf16/fp16
+    w: torch.Tensor,  # [N, K] fp8 e4m3
+    w_scale: torch.Tensor,  # [N, K//32] uint8 (E8M0)
+) -> torch.Tensor:
+    x_q, x_scale = mxfp8_e4m3_quantize(x)
+    return torch.ops.vllm.rocm_mxfp8_dot_scaled_mm(
+        x_q,
+        x_scale,
+        w,
+        w_scale,
+        x.dtype,
+    )
 
 
 def _select_cfg(M, N, K):
