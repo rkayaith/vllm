@@ -22,6 +22,9 @@ if rocm_aiter_ops.is_enabled():
     from .fusion.allreduce_rms_fusion import (
         RocmAiterAllReduceFusionPass,
     )
+    from .fusion.rocm_aiter_blockscale_gemm_rmsnorm_gemm_fusion import (
+        RocmAiterBlockscaleGemmRMSNormGemmFusionPass,
+    )
     from .fusion.rocm_aiter_fusion import (
         MLADualRMSNormFusionPass,
         RocmAiterRMSNormQuantFusionPass,
@@ -168,6 +171,7 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                     self.passes += [
                         RocmMxfp8GemmRMSNormQuantFusionPass(config),
                         RocmAiterRMSNormQuantFusionPass(config),
+                        RocmAiterBlockscaleGemmRMSNormGemmFusionPass(config),
                     ]
                 self.passes += [RMSNormQuantFusionPass(config)]
 
