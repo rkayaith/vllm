@@ -22,8 +22,6 @@ DECODE_GEMM_OP = torch.ops.vllm.rocm_aiter_gemm_a8w8_blockscale.default
 DECODE_GEMM_OP_PACKET = torch.ops.vllm.rocm_aiter_gemm_a8w8_blockscale
 RMSNORM_QUANT_OP = torch.ops.vllm.rocm_aiter_rmsnorm_with_add_fp8_group_quant.default
 RMSNORM_QUANT_OP_PACKET = torch.ops.vllm.rocm_aiter_rmsnorm_with_add_fp8_group_quant
-GROUP_QUANT_OP = torch.ops.vllm.rocm_aiter_group_fp8_quant.default
-
 REFERENCE_OP_NAME = "rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference"
 PASS_NAME = "rocm_aiter_blockscale_gemm_rmsnorm_gemm_fusion_pass"
 QWEN3_EPSILON = 1e-6
@@ -43,22 +41,24 @@ def rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference(
     gemm1_weight_scale: torch.Tensor,
     retained_gemm0: torch.Tensor,
     gemm0_use_triton: bool,
-    gemm1_use_triton: bool,
     gemm0_output_dtype: torch.dtype,
     gemm1_output_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute the two-GEMM Qwen3-32B block-FP8 candidate.
 
     This temporary, deliberately simple implementation defines the contract
-    for a future fused AITER kernel. It implements the ordering evaluated by
-    the numerical experiment in ``gemm.py``:
+    for a future fused AITER kernel. It implements the delayed-rounding
+    variant of the ordering evaluated by the numerical experiment in
+    ``gemm.py``:
 
-      GEMM1(quantize((GEMM0(input) + residual) * rms_weight)) * inverse_rms
+      FP32_GEMM1(quantize((GEMM0(input) + residual) * rms_weight))
+          * inverse_rms
 
     In contrast, the original model applies ``inverse_rms`` before
     quantization and GEMM1. Moving that row-wise factor after GEMM1 is
     algebraically valid, but the two paths can round differently in BF16 and
-    FP8. The final cast is therefore explicit and is part of this contract.
+    FP8. Keeping GEMM1's output and the inverse-RMS multiply in FP32 until the
+    original BF16 model boundary is part of this contract.
     """
     # The original GEMM0 result is an intentional numerical-check value. It is
     # not used for the fused arithmetic, but accepting it as an input keeps the
@@ -90,26 +90,62 @@ def rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference(
     )
     weighted = updated_residual * rms_weight
 
-    # Quantize the unnormalized, weighted activation using the same 1x128
-    # activation format consumed by Qwen3's block-scaled linear layers.
-    quantized, quantized_scale = GROUP_QUANT_OP(weighted, group_size)
+    # Quantize the unnormalized, weighted activation exactly as the numerical
+    # experiment does. Keep this as explicit PyTorch arithmetic: this op is a
+    # readable correctness model for a future fused kernel, not a fast path.
+    quantized, quantized_scale = _quantize_fp8_tile_activation(weighted, group_size)
 
     # GEMM1 consumes the newly quantized activation and its original 128x128
-    # block-scaled weight. As with GEMM0, preserve the wrapper chosen by vLLM.
-    gemm1_op = PREFILL_GEMM_OP if gemm1_use_triton else DECODE_GEMM_OP
-    gemm1 = gemm1_op(
+    # block-scaled weight. Always use AITER's Triton wrapper here, including
+    # for decode graphs that originally selected CK: Triton accumulates in
+    # FP32 and can store that accumulator to an FP32 output, while CK currently
+    # restricts block-scaled GEMM output to BF16/FP16.
+    gemm1 = PREFILL_GEMM_OP(
         quantized,
         gemm1_weight,
         quantized_scale,
         gemm1_weight_scale,
-        gemm1_output_dtype,
+        torch.float32,
     )
 
-    # Multiplication by the FP32 inverse RMS promotes GEMM1's BF16 output to
-    # FP32. Cast explicitly so the replacement has GEMM1's original contract.
-    # Return the updated residual as well: both externally visible results of
-    # the matched RMSNorm path must come from the eventual fused kernel.
-    return updated_residual, (gemm1 * inverse_rms).to(gemm1_output_dtype)
+    # Apply inverse RMS while the complete GEMM result is still FP32, then
+    # round once at the original BF16 model boundary. Return the pre-cast value
+    # separately so numerical checks can inspect the implemented arithmetic.
+    transformed_gemm1 = gemm1 * inverse_rms
+    model_gemm1 = transformed_gemm1.to(gemm1_output_dtype)
+    return updated_residual, transformed_gemm1, model_gemm1
+
+
+def _quantize_fp8_tile_activation(
+    input: torch.Tensor,
+    tile_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the gist's 1xN symmetric FP8 activation quantization."""
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_info = torch.finfo(fp8_dtype)
+    rows, columns = input.shape
+    tile_columns = (columns + tile_size - 1) // tile_size
+
+    # Pad only for the per-tile absolute-maximum reduction. The returned FP8
+    # activation retains the original shape, so padding never reaches GEMM1.
+    padded = torch.nn.functional.pad(
+        input.float(), (0, tile_columns * tile_size - columns)
+    )
+    absolute_maximum = (
+        padded.reshape(rows, tile_columns, tile_size)
+        .abs()
+        .amax(dim=-1)
+        .clamp(min=1e-12)
+    )
+
+    # The GEMM consumes inverse scales, one FP32 value per 1xtile_size block.
+    # Expand the forward scale only long enough to quantize each input value.
+    scale = (fp8_info.max / absolute_maximum).repeat_interleave(tile_size, dim=1)[
+        :, :columns
+    ]
+    quantized = (input.float() * scale).clamp(fp8_info.min, fp8_info.max).to(fp8_dtype)
+    inverse_scale = (absolute_maximum / fp8_info.max).to(torch.float32)
+    return quantized, inverse_scale
 
 
 def rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference_fake(
@@ -125,15 +161,19 @@ def rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference_fake(
     gemm1_weight_scale: torch.Tensor,
     retained_gemm0: torch.Tensor,
     gemm0_use_triton: bool,
-    gemm1_use_triton: bool,
     gemm0_output_dtype: torch.dtype,
     gemm1_output_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     del gemm0_weight, input_scale, gemm0_weight_scale, rms_weight, retained_gemm0
     del epsilon, group_size, gemm1_weight_scale, gemm0_use_triton
-    del gemm1_use_triton, gemm0_output_dtype
+    del gemm0_output_dtype
     return (
         torch.empty_like(residual),
+        torch.empty(
+            (input.shape[0], gemm1_weight.shape[0]),
+            dtype=torch.float32,
+            device=input.device,
+        ),
         torch.empty(
             (input.shape[0], gemm1_weight.shape[0]),
             dtype=gemm1_output_dtype,
@@ -280,23 +320,36 @@ def _replace_outputs(
                 gemm1.args[3],
                 gemm0,
                 _uses_triton_gemm(gemm0),
-                _uses_triton_gemm(gemm1),
                 gemm0.args[4],
                 gemm1.args[4],
             ),
         )
         updated_residual = graph.call_function(operator.getitem, args=(fused, 0))
-        gemm1_result = graph.call_function(operator.getitem, args=(fused, 1))
+        model_gemm1 = graph.call_function(
+            operator.getitem,
+            args=(fused, 2),
+        )
 
-    # Manually inserted nodes do not receive fake-value metadata. Preserve the
-    # values of both tuple elements for later vLLM passes.
-    if "val" in match.residual.meta and "val" in gemm1.meta:
-        fused.meta["val"] = (match.residual.meta["val"], gemm1.meta["val"])
+    # The gist intentionally leaves its final multiply in FP32. Preserve that
+    # value at the reference-op boundary for numerical inspection, while the
+    # graph consumes the separately returned BF16 model value. In particular,
+    # downstream AITER activation quantizers do not accept FP32. Manually
+    # inserted nodes do not receive fake-value metadata, so propagate all three
+    # tuple values explicitly.
+    transformed_meta = dict(gemm1.meta)
+    if "val" in transformed_meta:
+        transformed_meta["val"] = transformed_meta["val"].float()
+    if "val" in match.residual.meta and "val" in transformed_meta:
+        fused.meta["val"] = (
+            match.residual.meta["val"],
+            transformed_meta["val"],
+            gemm1.meta["val"],
+        )
     updated_residual.meta.update(match.residual.meta)
-    gemm1_result.meta.update(gemm1.meta)
+    model_gemm1.meta.update(gemm1.meta)
 
     match.residual.replace_all_uses_with(updated_residual)
-    gemm1.replace_all_uses_with(gemm1_result)
+    gemm1.replace_all_uses_with(model_gemm1)
 
 
 def _uses_triton_gemm(node: fx.Node) -> bool:

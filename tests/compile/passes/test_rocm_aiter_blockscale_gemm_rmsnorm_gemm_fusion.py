@@ -22,6 +22,9 @@ from vllm._aiter_ops import is_aiter_found_and_supported, rocm_aiter_ops
 if not hasattr(torch.ops.vllm, "rocm_aiter_gemm_a8w8_blockscale"):
     rocm_aiter_ops.register_ops_once.__wrapped__()  # pyright: ignore[reportFunctionMemberAccess]
 
+from vllm.compilation.passes.fusion import (
+    rocm_aiter_blockscale_gemm_rmsnorm_gemm_fusion as blockscale_fusion,
+)
 from vllm.compilation.passes.fusion.rocm_aiter_blockscale_gemm_rmsnorm_gemm_fusion import (  # noqa: E501
     DECODE_GEMM_OP,
     PREFILL_GEMM_OP,
@@ -213,7 +216,6 @@ def test_fusion_replaces_gemm1_and_residual_and_retains_gemm0(
     assert reference.args[10] is gemm0
     assert reference.args[11:] == (
         use_triton_gemm,
-        use_triton_gemm,
         torch.bfloat16,
         torch.bfloat16,
     )
@@ -222,11 +224,15 @@ def test_fusion_replaces_gemm1_and_residual_and_retains_gemm0(
         for node in reference.users
         if node.target == operator.getitem
     }
-    assert set(reference_outputs) == {0, 1}
+    assert set(reference_outputs) == {0, 2}
     assert reference_outputs[0].meta["val"].shape == (TOKENS, HIDDEN_SIZE)
-    assert reference_outputs[1].meta["val"].shape == (TOKENS, OUTPUT_SIZE)
+    assert reference_outputs[2].meta["val"].shape == (TOKENS, OUTPUT_SIZE)
+    assert reference_outputs[0].meta["val"].dtype == torch.bfloat16
+    assert reference.meta["val"][1].shape == (TOKENS, OUTPUT_SIZE)
+    assert reference.meta["val"][1].dtype == torch.float32
+    assert reference_outputs[2].meta["val"].dtype == torch.bfloat16
     assert reference_outputs[0].users
-    assert reference_outputs[1].users
+    assert reference_outputs[2].users
 
 
 def test_fusion_allows_independently_used_gemm0() -> None:
@@ -244,6 +250,77 @@ def test_fusion_allows_independently_used_gemm0() -> None:
     assert len(reference) == 1
     assert reference[0].args[10] is gemms[0]
     assert len(gemms[0].users) == 2
+
+
+def test_reference_uses_fp32_triton_gemm1_for_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, torch.dtype]] = []
+
+    def fake_gemm(
+        name: str,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        del input_scale, weight_scale
+        calls.append((name, output_dtype))
+        return torch.zeros(
+            input.shape[0],
+            weight.shape[0],
+            dtype=output_dtype,
+            device=input.device,
+        )
+
+    def fake_triton_gemm(*args: object) -> torch.Tensor:
+        return fake_gemm("triton", *args)  # type: ignore[arg-type]
+
+    def fake_decode_gemm(*args: object) -> torch.Tensor:
+        return fake_gemm("decode", *args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(blockscale_fusion, "PREFILL_GEMM_OP", fake_triton_gemm)
+    monkeypatch.setattr(blockscale_fusion, "DECODE_GEMM_OP", fake_decode_gemm)
+
+    inputs = _example_inputs(tokens=1, device="cpu")
+    (
+        input,
+        gemm0_weight,
+        input_scale,
+        gemm0_weight_scale,
+        residual_input,
+        rms_weight,
+        gemm1_weight,
+        gemm1_weight_scale,
+    ) = inputs
+    retained_gemm0 = torch.empty(1, HIDDEN_SIZE, dtype=torch.bfloat16)
+    residual, transformed, model_output = (
+        blockscale_fusion.rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference(
+            input,
+            gemm0_weight,
+            input_scale,
+            gemm0_weight_scale,
+            residual_input,
+            rms_weight,
+            QWEN3_EPSILON,
+            QWEN3_GROUP_SIZE,
+            gemm1_weight,
+            gemm1_weight_scale,
+            retained_gemm0,
+            False,
+            torch.bfloat16,
+            torch.bfloat16,
+        )
+    )
+
+    assert calls == [
+        ("decode", torch.bfloat16),
+        ("triton", torch.float32),
+    ]
+    assert residual.dtype == torch.bfloat16
+    assert transformed.dtype == torch.float32
+    assert model_output.dtype == torch.bfloat16
 
 
 @pytest.mark.skipif(
@@ -359,7 +436,7 @@ def test_fusion_rejects_independently_used_quant_output(extra_output: str) -> No
         pytest.param(DECODE_GEMM_OP, 1, False, id="decode-ck"),
     ],
 )
-def test_reference_op_is_bitwise_equal_to_gist_ordering(
+def test_reference_op_is_bitwise_equal_to_fp32_gemm1_ordering(
     gemm_op: OpOverload,
     tokens: int,
     use_triton_gemm: bool,
@@ -368,33 +445,36 @@ def test_reference_op_is_bitwise_equal_to_gist_ordering(
     inputs = _random_example_inputs(tokens=tokens)
 
     with torch.no_grad():
-        retained_gemm0, expected_residual, expected = _gist_ordering(
-            *inputs, gemm0_op=gemm_op, gemm1_op=gemm_op
+        retained_gemm0, expected_residual, expected = _fp32_gemm1_ordering(
+            *inputs, gemm0_op=gemm_op
         )
         original = _original_ordering(*inputs, gemm0_op=gemm_op, gemm1_op=gemm_op)
-        actual_residual, actual = REFERENCE_OP(
+        actual_residual, actual, actual_model_output = REFERENCE_OP(
             *inputs[:6],
             QWEN3_EPSILON,
             QWEN3_GROUP_SIZE,
             *inputs[6:],
             retained_gemm0,
             use_triton_gemm,
-            use_triton_gemm,
             torch.bfloat16,
             torch.bfloat16,
         )
     torch.cuda.synchronize()
 
-    assert actual.dtype == torch.bfloat16
+    assert actual.dtype == torch.float32
+    assert actual_model_output.dtype == torch.bfloat16
     assert torch.equal(actual_residual, expected_residual)
     assert torch.equal(actual, expected)
+    assert torch.equal(actual_model_output, expected.to(torch.bfloat16))
+    assert not torch.equal(actual, expected.to(torch.bfloat16).float())
+    assert not torch.equal(actual, original.float())
     relative_error = torch.linalg.vector_norm(actual.float() - original.float()) / (
         torch.linalg.vector_norm(original.float())
     )
     assert relative_error < 0.05
 
 
-def _gist_ordering(
+def _fp32_gemm1_ordering(
     input: torch.Tensor,
     gemm0_weight: torch.Tensor,
     input_scale: torch.Tensor,
@@ -405,7 +485,6 @@ def _gist_ordering(
     gemm1_weight_scale: torch.Tensor,
     *,
     gemm0_op: OpOverload,
-    gemm1_op: OpOverload,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     gemm0 = gemm0_op(
         input,
@@ -419,15 +498,19 @@ def _gist_ordering(
         updated_residual.float().pow(2).mean(dim=-1, keepdim=True) + QWEN3_EPSILON
     )
     weighted = updated_residual * rms_weight
-    quantized, quantized_scale = GROUP_QUANT_OP(weighted, QWEN3_GROUP_SIZE)
-    gemm1 = gemm1_op(
+    quantized, quantized_scale = _quantize_fp8_tile_activation(
+        weighted, QWEN3_GROUP_SIZE
+    )
+    # GEMM1 deliberately uses Triton for both prefill and decode because the
+    # CK wrapper cannot emit the FP32 result required by this ordering.
+    gemm1 = PREFILL_GEMM_OP(
         quantized,
         gemm1_weight,
         quantized_scale,
         gemm1_weight_scale,
-        torch.bfloat16,
+        torch.float32,
     )
-    return gemm0, updated_residual, (gemm1 * inverse_rms).to(torch.bfloat16)
+    return gemm0, updated_residual, gemm1 * inverse_rms
 
 
 def _original_ordering(
@@ -464,6 +547,33 @@ def _original_ordering(
         gemm1_weight_scale,
         torch.bfloat16,
     )
+
+
+def _quantize_fp8_tile_activation(
+    input: torch.Tensor,
+    tile_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fp8_info = torch.finfo(torch.float8_e4m3fn)
+    rows, columns = input.shape
+    tile_columns = (columns + tile_size - 1) // tile_size
+    padded = torch.nn.functional.pad(
+        input.float(), (0, tile_columns * tile_size - columns)
+    )
+    absolute_maximum = (
+        padded.reshape(rows, tile_columns, tile_size)
+        .abs()
+        .amax(dim=-1)
+        .clamp(min=1e-12)
+    )
+    scale = (fp8_info.max / absolute_maximum).repeat_interleave(tile_size, dim=1)[
+        :, :columns
+    ]
+    quantized = (
+        (input.float() * scale)
+        .clamp(fp8_info.min, fp8_info.max)
+        .to(torch.float8_e4m3fn)
+    )
+    return quantized, (absolute_maximum / fp8_info.max).to(torch.float32)
 
 
 def _random_example_inputs(*, tokens: int) -> list[torch.Tensor]:
