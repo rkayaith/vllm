@@ -22,17 +22,14 @@ if rocm_aiter_ops.is_enabled():
     from .fusion.allreduce_rms_fusion import (
         RocmAiterAllReduceFusionPass,
     )
-    from .fusion.rocm_aiter_blockscale_gemm_rmsnorm_gemm_fusion import (
-        RocmAiterBlockscaleGemmRMSNormGemmFusionPass,
-    )
     from .fusion.rocm_aiter_fusion import (
         MLADualRMSNormFusionPass,
         RocmAiterRMSNormQuantFusionPass,
         RocmAiterSiluMulFp8GroupQuantFusionPass,
         RocmAiterTritonAddRMSNormPadFusionPass,
     )
-    from .fusion.rocm_mxfp8_gemm_rmsnorm_quant_fusion import (
-        RocmMxfp8GemmRMSNormQuantFusionPass,
+    from .fusion.rocm_coda_gemm_rmsnorm_gemm_fusion import (
+        RocmCodaGemmRMSNormGemmFusionPass,
     )
 
 if current_platform.is_cuda_alike() or current_platform.is_xpu():
@@ -169,9 +166,8 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
             if self.pass_config.fuse_norm_quant:
                 if rocm_aiter_ops.is_enabled():
                     self.passes += [
-                        RocmMxfp8GemmRMSNormQuantFusionPass(config),
+                        RocmCodaGemmRMSNormGemmFusionPass(config),
                         RocmAiterRMSNormQuantFusionPass(config),
-                        RocmAiterBlockscaleGemmRMSNormGemmFusionPass(config),
                     ]
                 self.passes += [RMSNormQuantFusionPass(config)]
 

@@ -12,6 +12,7 @@ from torch._ops import OpOverload
 from torch.fx.experimental.proxy_tensor import make_fx
 
 import vllm.config
+import vllm.ir.ops
 import vllm.kernels.aiter_ops  # noqa: F401
 from vllm._aiter_ops import is_aiter_found_and_supported, rocm_aiter_ops
 
@@ -23,15 +24,21 @@ if not hasattr(torch.ops.vllm, "rocm_aiter_gemm_a8w8_blockscale"):
     rocm_aiter_ops.register_ops_once.__wrapped__()  # pyright: ignore[reportFunctionMemberAccess]
 
 from vllm.compilation.passes.fusion import (
-    rocm_aiter_blockscale_gemm_rmsnorm_gemm_fusion as blockscale_fusion,
+    rocm_coda_gemm_rmsnorm_gemm_fusion as coda_fusion,
 )
-from vllm.compilation.passes.fusion.rocm_aiter_blockscale_gemm_rmsnorm_gemm_fusion import (  # noqa: E501
-    DECODE_GEMM_OP,
-    PREFILL_GEMM_OP,
+from vllm.compilation.passes.fusion.rocm_coda_gemm_rmsnorm_gemm_fusion import (
+    BLOCK_FP8_DECODE_GEMM_OP as DECODE_GEMM_OP,
+)
+from vllm.compilation.passes.fusion.rocm_coda_gemm_rmsnorm_gemm_fusion import (
+    BLOCK_FP8_PREFILL_GEMM_OP as PREFILL_GEMM_OP,
+)
+from vllm.compilation.passes.fusion.rocm_coda_gemm_rmsnorm_gemm_fusion import (
+    BLOCK_FP8_REFERENCE_OP as REFERENCE_OP,
+)
+from vllm.compilation.passes.fusion.rocm_coda_gemm_rmsnorm_gemm_fusion import (
     QWEN3_EPSILON,
     QWEN3_GROUP_SIZE,
-    REFERENCE_OP,
-    RocmAiterBlockscaleGemmRMSNormGemmFusionPass,
+    RocmCodaGemmRMSNormGemmFusionPass,
 )
 from vllm.config import (
     CompilationConfig,
@@ -45,6 +52,7 @@ from vllm.platforms import current_platform
 
 RMSNORM_QUANT_OP = torch.ops.vllm.rocm_aiter_rmsnorm_with_add_fp8_group_quant.default
 GROUP_QUANT_OP = torch.ops.vllm.rocm_aiter_group_fp8_quant.default
+FUSED_ADD_RMS_NORM_OP = torch.ops.vllm_ir.fused_add_rms_norm.default
 FP8_DTYPE = current_platform.fp8_dtype()
 TOKENS = 4
 INPUT_SIZE = 256
@@ -77,13 +85,14 @@ def _qwen3_block_fp8_chain(
         gemm0_weight_scale,
         gemm0_output_dtype,
     )
-    quantized, residual_out, quantized_scale = RMSNORM_QUANT_OP(
+    normalized, residual_out = FUSED_ADD_RMS_NORM_OP(
         gemm0,
         residual,
         rms_weight,
         epsilon,
-        group_size,
+        None,
     )
+    quantized, quantized_scale = GROUP_QUANT_OP(normalized, group_size)
     gemm1 = gemm1_op(
         quantized,
         gemm1_weight,
@@ -159,15 +168,13 @@ def _trace_chain(
     return make_fx(f, tracing_mode="fake")(*_example_inputs())
 
 
-def _run_fusion(
-    graph: fx.Graph,
-) -> RocmAiterBlockscaleGemmRMSNormGemmFusionPass:
+def _run_fusion(graph: fx.Graph) -> RocmCodaGemmRMSNormGemmFusionPass:
     vllm_config = VllmConfig(
         compilation_config=CompilationConfig(mode=CompilationMode.VLLM_COMPILE),
         device_config=DeviceConfig(device=torch.device("cuda")),
     )
     with vllm.config.set_current_vllm_config(vllm_config):
-        fusion_pass = RocmAiterBlockscaleGemmRMSNormGemmFusionPass(vllm_config)
+        fusion_pass = RocmCodaGemmRMSNormGemmFusionPass(vllm_config)
         fusion_pass(graph)
     return fusion_pass
 
@@ -183,16 +190,19 @@ def _nodes_with_target(graph: fx.Graph, target: object) -> list[fx.Node]:
         pytest.param(DECODE_GEMM_OP, False, id="decode-ck"),
     ],
 )
-def test_fusion_replaces_gemm1_and_residual_and_retains_gemm0(
+def test_fusion_replaces_complete_chain(
     gemm_op: OpOverload,
     use_triton_gemm: bool,
 ) -> None:
     graph_module = _trace_chain(gemm0_op=gemm_op, gemm1_op=gemm_op)
     original_gemms = _nodes_with_target(graph_module.graph, gemm_op)
     assert len(original_gemms) == 2
-    original_rmsnorm_quant = _nodes_with_target(graph_module.graph, RMSNORM_QUANT_OP)
-    assert len(original_rmsnorm_quant) == 1
-    rmsnorm_args = original_rmsnorm_quant[0].args[1:5]
+    gemm0_args = original_gemms[0].args
+    original_rmsnorm = _nodes_with_target(graph_module.graph, FUSED_ADD_RMS_NORM_OP)
+    original_quant = _nodes_with_target(graph_module.graph, GROUP_QUANT_OP)
+    assert len(original_rmsnorm) == 1
+    assert len(original_quant) == 1
+    rmsnorm_args = original_rmsnorm[0].args[1:4] + (original_quant[0].args[1],)
     gemm1_weight = original_gemms[1].args[1]
     gemm1_weight_scale = original_gemms[1].args[3]
     fusion_pass = _run_fusion(graph_module.graph)
@@ -201,20 +211,15 @@ def test_fusion_replaces_gemm1_and_residual_and_retains_gemm0(
     fused = _nodes_with_target(graph_module.graph, REFERENCE_OP)
     assert len(fused) == 1
 
-    # GEMM1 and the updated residual are replaced. GEMM0 stays live through
-    # its independent numerical-check output, while the combined RMSNorm/quant
-    # operation and its old tuple projections become dead.
-    gemms = _nodes_with_target(graph_module.graph, gemm_op)
-    assert len(gemms) == 1
-    gemm0 = gemms[0]
-    assert not _nodes_with_target(graph_module.graph, RMSNORM_QUANT_OP)
+    assert not _nodes_with_target(graph_module.graph, gemm_op)
+    assert not _nodes_with_target(graph_module.graph, FUSED_ADD_RMS_NORM_OP)
+    assert not _nodes_with_target(graph_module.graph, GROUP_QUANT_OP)
 
     reference = fused[0]
-    assert reference.args[:4] == gemm0.args[:4]
+    assert reference.args[:4] == gemm0_args[:4]
     assert reference.args[4:8] == rmsnorm_args
     assert reference.args[8:10] == (gemm1_weight, gemm1_weight_scale)
-    assert reference.args[10] is gemm0
-    assert reference.args[11:] == (
+    assert reference.args[10:] == (
         use_triton_gemm,
         torch.bfloat16,
         torch.bfloat16,
@@ -248,8 +253,8 @@ def test_fusion_allows_independently_used_gemm0() -> None:
     assert len(gemms) == 1
     reference = _nodes_with_target(graph_module.graph, REFERENCE_OP)
     assert len(reference) == 1
-    assert reference[0].args[10] is gemms[0]
-    assert len(gemms[0].users) == 2
+    assert gemms[0] not in reference[0].args
+    assert len(gemms[0].users) == 1
 
 
 def test_reference_uses_fp32_triton_gemm1_for_decode(
@@ -265,7 +270,6 @@ def test_reference_uses_fp32_triton_gemm1_for_decode(
         weight_scale: torch.Tensor,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
-        del input_scale, weight_scale
         calls.append((name, output_dtype))
         return torch.zeros(
             input.shape[0],
@@ -280,8 +284,8 @@ def test_reference_uses_fp32_triton_gemm1_for_decode(
     def fake_decode_gemm(*args: object) -> torch.Tensor:
         return fake_gemm("decode", *args)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(blockscale_fusion, "PREFILL_GEMM_OP", fake_triton_gemm)
-    monkeypatch.setattr(blockscale_fusion, "DECODE_GEMM_OP", fake_decode_gemm)
+    monkeypatch.setattr(coda_fusion, "BLOCK_FP8_PREFILL_GEMM_OP", fake_triton_gemm)
+    monkeypatch.setattr(coda_fusion, "BLOCK_FP8_DECODE_GEMM_OP", fake_decode_gemm)
 
     inputs = _example_inputs(tokens=1, device="cpu")
     (
@@ -294,9 +298,8 @@ def test_reference_uses_fp32_triton_gemm1_for_decode(
         gemm1_weight,
         gemm1_weight_scale,
     ) = inputs
-    retained_gemm0 = torch.empty(1, HIDDEN_SIZE, dtype=torch.bfloat16)
     residual, transformed, model_output = (
-        blockscale_fusion.rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference(
+        coda_fusion.rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference(
             input,
             gemm0_weight,
             input_scale,
@@ -307,7 +310,6 @@ def test_reference_uses_fp32_triton_gemm1_for_decode(
             QWEN3_GROUP_SIZE,
             gemm1_weight,
             gemm1_weight_scale,
-            retained_gemm0,
             False,
             torch.bfloat16,
             torch.bfloat16,
@@ -323,11 +325,79 @@ def test_reference_uses_fp32_triton_gemm1_for_decode(
     assert model_output.dtype == torch.bfloat16
 
 
+def test_combined_pass_preserves_block_fp8_reference_numerics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_gemm(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return (input.float() @ weight.float().T).to(output_dtype)
+
+    monkeypatch.setattr(coda_fusion, "BLOCK_FP8_PREFILL_GEMM_OP", fake_gemm)
+    monkeypatch.setattr(coda_fusion, "BLOCK_FP8_DECODE_GEMM_OP", fake_gemm)
+
+    torch.manual_seed(0)
+    inputs = _example_inputs(tokens=2, device="cpu")
+    inputs[0].copy_(torch.randn(2, INPUT_SIZE).to(FP8_DTYPE))
+    inputs[1].copy_(torch.randn(HIDDEN_SIZE, INPUT_SIZE).to(FP8_DTYPE))
+    inputs[2].fill_(1.0)
+    inputs[3].fill_(1.0)
+    inputs[4].copy_(torch.randn(2, HIDDEN_SIZE).to(torch.bfloat16))
+    inputs[5].copy_((torch.randn(HIDDEN_SIZE) * 0.02 + 1.0).to(torch.bfloat16))
+    inputs[6].copy_(torch.randn(OUTPUT_SIZE, HIDDEN_SIZE).to(FP8_DTYPE))
+    inputs[7].fill_(1.0)
+
+    gemm0 = fake_gemm(inputs[0], inputs[1], inputs[2], inputs[3], torch.bfloat16)
+    expected_residual = gemm0 + inputs[4]
+    inverse_rms = torch.rsqrt(
+        expected_residual.float().pow(2).mean(dim=-1, keepdim=True) + QWEN3_EPSILON
+    )
+    weighted = expected_residual * inputs[5]
+    quantized, quantized_scale = _quantize_fp8_tile_activation(
+        weighted, QWEN3_GROUP_SIZE
+    )
+    expected_gemm1 = fake_gemm(
+        quantized,
+        inputs[6],
+        quantized_scale,
+        inputs[7],
+        torch.float32,
+    )
+    expected = expected_gemm1 * inverse_rms
+
+    actual_residual, actual, actual_model_output = (
+        coda_fusion.rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference(
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            inputs[4],
+            inputs[5],
+            QWEN3_EPSILON,
+            QWEN3_GROUP_SIZE,
+            inputs[6],
+            inputs[7],
+            False,
+            torch.bfloat16,
+            torch.bfloat16,
+        )
+    )
+
+    assert torch.equal(actual_residual, expected_residual)
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_model_output, expected.to(torch.bfloat16))
+    assert not torch.equal(actual, actual_model_output.float())
+
+
 @pytest.mark.skipif(
     not rocm_aiter_ops.is_enabled(),
     reason="Pass manager registers ROCm AITER passes only when AITER is enabled",
 )
-def test_fusion_runs_after_aiter_rmsnorm_quant_fusion() -> None:
+def test_coda_fusion_runs_before_aiter_rmsnorm_quant_fusion() -> None:
     from vllm.compilation.passes.fusion.rocm_aiter_fusion import (
         RocmAiterRMSNormQuantFusionPass,
     )
@@ -352,9 +422,9 @@ def test_fusion_runs_after_aiter_rmsnorm_quant_fusion() -> None:
     two_gemm_index = next(
         index
         for index, pass_ in enumerate(pass_manager.passes)
-        if isinstance(pass_, RocmAiterBlockscaleGemmRMSNormGemmFusionPass)
+        if isinstance(pass_, RocmCodaGemmRMSNormGemmFusionPass)
     )
-    assert rmsnorm_quant_index < two_gemm_index
+    assert two_gemm_index < rmsnorm_quant_index
 
 
 @pytest.mark.parametrize(
@@ -445,16 +515,13 @@ def test_reference_op_is_bitwise_equal_to_fp32_gemm1_ordering(
     inputs = _random_example_inputs(tokens=tokens)
 
     with torch.no_grad():
-        retained_gemm0, expected_residual, expected = _fp32_gemm1_ordering(
-            *inputs, gemm0_op=gemm_op
-        )
+        expected_residual, expected = _fp32_gemm1_ordering(*inputs, gemm0_op=gemm_op)
         original = _original_ordering(*inputs, gemm0_op=gemm_op, gemm1_op=gemm_op)
         actual_residual, actual, actual_model_output = REFERENCE_OP(
             *inputs[:6],
             QWEN3_EPSILON,
             QWEN3_GROUP_SIZE,
             *inputs[6:],
-            retained_gemm0,
             use_triton_gemm,
             torch.bfloat16,
             torch.bfloat16,
@@ -485,7 +552,7 @@ def _fp32_gemm1_ordering(
     gemm1_weight_scale: torch.Tensor,
     *,
     gemm0_op: OpOverload,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     gemm0 = gemm0_op(
         input,
         gemm0_weight,
@@ -510,7 +577,7 @@ def _fp32_gemm1_ordering(
         gemm1_weight_scale,
         torch.float32,
     )
-    return gemm0, updated_residual, gemm1 * inverse_rms
+    return updated_residual, gemm1 * inverse_rms
 
 
 def _original_ordering(
