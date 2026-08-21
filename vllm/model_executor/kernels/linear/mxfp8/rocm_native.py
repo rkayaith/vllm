@@ -25,6 +25,38 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
 
+def shuffle_mxfp8_scale_gfx950(scale: torch.Tensor) -> torch.Tensor:
+    """Convert row-major MXFP8 scales to gfx950 ``32x8`` storage."""
+    if scale.ndim != 2:
+        raise ValueError(f"scale must be two-dimensional, got shape {scale.shape}")
+
+    rows, columns = scale.shape
+    padded_rows = (rows + 31) // 32 * 32
+    padded_columns = (columns + 7) // 8 * 8
+    padded = torch.zeros(
+        (padded_rows, padded_columns), dtype=scale.dtype, device=scale.device
+    )
+    padded[:rows, :columns] = scale
+    return (
+        padded.view(padded_rows // 32, 2, 16, padded_columns // 8, 2, 4)
+        .permute(0, 3, 5, 2, 4, 1)
+        .contiguous()
+        .view(padded_rows, padded_columns)
+    )
+
+
+@triton.jit
+def _gfx950_scale_offset(row, column, padded_columns):
+    return (
+        (row // 32) * padded_columns * 32
+        + (column // 8) * 256
+        + (column % 4) * 64
+        + (row % 16) * 4
+        + ((column // 4) % 2) * 2
+        + ((row // 16) % 2)
+    )
+
+
 @triton.jit
 def _mxfp8_linear_kernel(
     x_ptr,
@@ -48,6 +80,7 @@ def _mxfp8_linear_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    SCALES_GFX950: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -59,9 +92,18 @@ def _mxfp8_linear_kernel(
     n_mask = offs_n < N
 
     x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
-    xs_ptrs = xs_ptr + offs_m[:, None] * stride_xsm + offs_sk[None, :] * stride_xsk
     w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
-    ws_ptrs = ws_ptr + offs_n[:, None] * stride_wsn + offs_sk[None, :] * stride_wsk
+    if SCALES_GFX950:
+        tl.static_assert(BLOCK_K % 256 == 0)
+        xs_ptrs = xs_ptr + _gfx950_scale_offset(
+            offs_m[:, None], offs_sk[None, :], K // 32
+        )
+        ws_ptrs = ws_ptr + _gfx950_scale_offset(
+            offs_n[:, None], offs_sk[None, :], K // 32
+        )
+    else:
+        xs_ptrs = xs_ptr + offs_m[:, None] * stride_xsm + offs_sk[None, :] * stride_xsk
+        ws_ptrs = ws_ptr + offs_n[:, None] * stride_wsn + offs_sk[None, :] * stride_wsk
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for _ in range(0, tl.cdiv(K, BLOCK_K)):
@@ -72,8 +114,12 @@ def _mxfp8_linear_kernel(
         acc += tl.dot_scaled(x, xs, "e4m3", w.T, ws, "e4m3")
         x_ptrs += BLOCK_K * stride_xk
         w_ptrs += BLOCK_K * stride_wk
-        xs_ptrs += (BLOCK_K // 32) * stride_xsk
-        ws_ptrs += (BLOCK_K // 32) * stride_wsk
+        if SCALES_GFX950:
+            xs_ptrs += BLOCK_K
+            ws_ptrs += BLOCK_K
+        else:
+            xs_ptrs += (BLOCK_K // 32) * stride_xsk
+            ws_ptrs += (BLOCK_K // 32) * stride_wsk
 
     o_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
     tl.store(
@@ -87,6 +133,42 @@ def _rocm_mxfp8_dot_scaled_mm_impl(
     w: torch.Tensor,  # [N, K] fp8 e4m3
     w_scale: torch.Tensor,  # [N, K//32] uint8 (E8M0)
     output_dtype: torch.dtype,
+) -> torch.Tensor:
+    return _rocm_mxfp8_dot_scaled_mm_launch(
+        x, x_scale, w, w_scale, output_dtype, scales_gfx950=False
+    )
+
+
+def _rocm_mxfp8_dot_scaled_mm_gfx950_impl(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    M, K = x.shape
+    N = w.shape[0]
+    assert K % 256 == 0, f"input columns must be divisible by 256, got {K}"
+    expected_scale_columns = (K // MXFP8_BLOCK_SIZE + 7) // 8 * 8
+    assert x_scale.shape == ((M + 31) // 32 * 32, expected_scale_columns)
+    assert w_scale.shape == ((N + 31) // 32 * 32, expected_scale_columns)
+    assert x_scale.dtype == MXFP8_SCALE_DTYPE
+    assert w_scale.dtype == MXFP8_SCALE_DTYPE
+    assert x_scale.is_contiguous()
+    assert w_scale.is_contiguous()
+    return _rocm_mxfp8_dot_scaled_mm_launch(
+        x, x_scale, w, w_scale, output_dtype, scales_gfx950=True
+    )
+
+
+def _rocm_mxfp8_dot_scaled_mm_launch(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    *,
+    scales_gfx950: bool,
 ) -> torch.Tensor:
     M, K = x.shape
     N = w.shape[0]
@@ -115,6 +197,7 @@ def _rocm_mxfp8_dot_scaled_mm_impl(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        SCALES_GFX950=scales_gfx950,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -136,9 +219,45 @@ def _rocm_mxfp8_dot_scaled_mm_fake(
     )
 
 
+def _rocm_aiter_mxfp8_quantize_gfx950_impl(
+    input: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.gemm_rmsnorm_gemm import quantize_mxfp8_gfx950
+
+    return quantize_mxfp8_gfx950(input)
+
+
+def _rocm_aiter_mxfp8_quantize_gfx950_fake(
+    input: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, columns = input.shape
+    padded_rows = (rows + 31) // 32 * 32
+    scale_columns = (columns // MXFP8_BLOCK_SIZE + 7) // 8 * 8
+    return (
+        torch.empty_like(input, dtype=torch.float8_e4m3fn),
+        torch.empty(
+            (padded_rows, scale_columns),
+            dtype=MXFP8_SCALE_DTYPE,
+            device=input.device,
+        ),
+    )
+
+
 direct_register_custom_op(
     op_name="rocm_mxfp8_dot_scaled_mm",
     op_func=_rocm_mxfp8_dot_scaled_mm_impl,
+    fake_impl=_rocm_mxfp8_dot_scaled_mm_fake,
+)
+
+direct_register_custom_op(
+    op_name="rocm_aiter_mxfp8_quantize_gfx950",
+    op_func=_rocm_aiter_mxfp8_quantize_gfx950_impl,
+    fake_impl=_rocm_aiter_mxfp8_quantize_gfx950_fake,
+)
+
+direct_register_custom_op(
+    op_name="rocm_mxfp8_dot_scaled_mm_gfx950",
+    op_func=_rocm_mxfp8_dot_scaled_mm_gfx950_impl,
     fake_impl=_rocm_mxfp8_dot_scaled_mm_fake,
 )
 
@@ -150,6 +269,21 @@ def _mxfp8_dot_scaled_linear(
 ) -> torch.Tensor:
     x_q, x_scale = mxfp8_e4m3_quantize(x)
     return torch.ops.vllm.rocm_mxfp8_dot_scaled_mm(
+        x_q,
+        x_scale,
+        w,
+        w_scale,
+        x.dtype,
+    )
+
+
+def _mxfp8_dot_scaled_linear_gfx950(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+) -> torch.Tensor:
+    x_q, x_scale = torch.ops.vllm.rocm_aiter_mxfp8_quantize_gfx950(x)
+    return torch.ops.vllm.rocm_mxfp8_dot_scaled_mm_gfx950(
         x_q,
         x_scale,
         w,
@@ -281,6 +415,44 @@ class RocmDotScaledMxfp8LinearKernel(Mxfp8LinearKernel):
             w_bf16 = dequant_mxfp8_to_bf16(layer.weight, layer.weight_scale)
             out = torch.nn.functional.linear(x2d, w_bf16).to(x.dtype)
         out = out.reshape(out_shape)
+        if bias is not None:
+            out = out + bias
+        return out
+
+
+class RocmHipbmmMxfp8LinearKernel(RocmDotScaledMxfp8LinearKernel):
+    """gfx950 MXFP8 backend for the hipbmm fused-epilogue scale layout."""
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight = layer.weight.data
+        N, K = weight.shape
+        assert K % 256 == 0, f"weight columns must be divisible by 256, got {K}"
+        scale_k = K // MXFP8_BLOCK_SIZE
+        weight_scale = layer.weight_scale.data[:N, :scale_k].contiguous()
+        layer.weight = Parameter(weight.contiguous(), requires_grad=False)
+        layer.weight_scale = Parameter(
+            shuffle_mxfp8_scale_gfx950(weight_scale), requires_grad=False
+        )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if layer.weight_scale.dtype != MXFP8_SCALE_DTYPE:
+            raise ValueError(
+                f"Expected {MXFP8_SCALE_DTYPE} weight_scale, got "
+                f"{layer.weight_scale.dtype}."
+            )
+        assert x.shape[-1] % 256 == 0, (
+            f"input columns must be divisible by 256, got {x.shape[-1]}"
+        )
+        out_shape = (*x.shape[:-1], layer.weight.shape[0])
+        x2d = x.reshape(-1, x.shape[-1])
+        out = _mxfp8_dot_scaled_linear_gfx950(
+            x2d, layer.weight, layer.weight_scale
+        ).reshape(out_shape)
         if bias is not None:
             out = out + bias
         return out

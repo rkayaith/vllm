@@ -181,6 +181,9 @@ class KernelConfig:
     enable_bf16x3_router_gemm: bool = False
     """If True, use the experimental SM100 BF16x3 CuteDSL router GEMM."""
 
+    use_hipbmm_fused_epilogue: bool = False
+    """Select the ROCm MXFP8 layout required by the hipbmm fused epilogue."""
+
     moe_backend: MoEBackend = "auto"
     """Backend for MoE expert computation kernels. Available options:
 

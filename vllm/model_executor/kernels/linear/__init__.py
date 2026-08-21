@@ -105,6 +105,7 @@ from vllm.model_executor.kernels.linear.mxfp8.marlin import (
 )
 from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (
     RocmDotScaledMxfp8LinearKernel,
+    RocmHipbmmMxfp8LinearKernel,
 )
 from vllm.model_executor.kernels.linear.mxfp8.xpu import (
     XPUMxFp8LinearKernel,
@@ -207,6 +208,13 @@ def _get_linear_backend() -> str:
     if config is not None:
         return config.kernel_config.linear_backend
     return "auto"
+
+
+def _use_hipbmm_fused_epilogue() -> bool:
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    return bool(config and config.kernel_config.use_hipbmm_fused_epilogue)
 
 
 # Mapping from linear_backend name to the set of kernel classes it covers.
@@ -765,7 +773,10 @@ def init_mxfp8_linear_kernel() -> Mxfp8LinearKernel:
     config = Mxfp8LinearLayerConfig()
 
     platform = current_platform._enum
-    possible = list(_POSSIBLE_MXFP8_KERNELS.get(platform, []))
+    if _use_hipbmm_fused_epilogue():
+        possible = [RocmHipbmmMxfp8LinearKernel]
+    else:
+        possible = list(_POSSIBLE_MXFP8_KERNELS.get(platform, []))
 
     # Apply --linear-backend filtering when set.
     linear_backend = _get_linear_backend()
