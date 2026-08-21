@@ -229,15 +229,13 @@ def test_fusion_replaces_complete_chain(
         for node in reference.users
         if node.target == operator.getitem
     }
-    assert set(reference_outputs) == {0, 2}
+    assert set(reference_outputs) == {0, 1}
     assert reference_outputs[0].meta["val"].shape == (TOKENS, HIDDEN_SIZE)
-    assert reference_outputs[2].meta["val"].shape == (TOKENS, OUTPUT_SIZE)
+    assert reference_outputs[1].meta["val"].shape == (TOKENS, OUTPUT_SIZE)
     assert reference_outputs[0].meta["val"].dtype == torch.bfloat16
-    assert reference.meta["val"][1].shape == (TOKENS, OUTPUT_SIZE)
-    assert reference.meta["val"][1].dtype == torch.float32
-    assert reference_outputs[2].meta["val"].dtype == torch.bfloat16
+    assert reference_outputs[1].meta["val"].dtype == torch.bfloat16
     assert reference_outputs[0].users
-    assert reference_outputs[2].users
+    assert reference_outputs[1].users
 
 
 def test_fusion_allows_independently_used_gemm0() -> None:
@@ -298,7 +296,7 @@ def test_reference_uses_fp32_triton_gemm1_for_decode(
         gemm1_weight,
         gemm1_weight_scale,
     ) = inputs
-    residual, transformed, model_output = (
+    residual, model_output = (
         coda_fusion.rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference(
             input,
             gemm0_weight,
@@ -321,7 +319,6 @@ def test_reference_uses_fp32_triton_gemm1_for_decode(
         ("triton", torch.float32),
     ]
     assert residual.dtype == torch.bfloat16
-    assert transformed.dtype == torch.float32
     assert model_output.dtype == torch.bfloat16
 
 
@@ -369,7 +366,7 @@ def test_combined_pass_preserves_block_fp8_reference_numerics(
     )
     expected = expected_gemm1 * inverse_rms
 
-    actual_residual, actual, actual_model_output = (
+    actual_residual, actual_model_output = (
         coda_fusion.rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference(
             inputs[0],
             inputs[1],
@@ -388,9 +385,8 @@ def test_combined_pass_preserves_block_fp8_reference_numerics(
     )
 
     assert torch.equal(actual_residual, expected_residual)
-    assert torch.equal(actual, expected)
     assert torch.equal(actual_model_output, expected.to(torch.bfloat16))
-    assert not torch.equal(actual, actual_model_output.float())
+    assert not torch.equal(expected, actual_model_output.float())
 
 
 @pytest.mark.skipif(
@@ -517,7 +513,7 @@ def test_reference_op_is_bitwise_equal_to_fp32_gemm1_ordering(
     with torch.no_grad():
         expected_residual, expected = _fp32_gemm1_ordering(*inputs, gemm0_op=gemm_op)
         original = _original_ordering(*inputs, gemm0_op=gemm_op, gemm1_op=gemm_op)
-        actual_residual, actual, actual_model_output = REFERENCE_OP(
+        actual_residual, actual_model_output = REFERENCE_OP(
             *inputs[:6],
             QWEN3_EPSILON,
             QWEN3_GROUP_SIZE,
@@ -528,16 +524,13 @@ def test_reference_op_is_bitwise_equal_to_fp32_gemm1_ordering(
         )
     torch.cuda.synchronize()
 
-    assert actual.dtype == torch.float32
     assert actual_model_output.dtype == torch.bfloat16
     assert torch.equal(actual_residual, expected_residual)
-    assert torch.equal(actual, expected)
     assert torch.equal(actual_model_output, expected.to(torch.bfloat16))
-    assert not torch.equal(actual, expected.to(torch.bfloat16).float())
-    assert not torch.equal(actual, original.float())
-    relative_error = torch.linalg.vector_norm(actual.float() - original.float()) / (
-        torch.linalg.vector_norm(original.float())
-    )
+    assert not torch.equal(actual_model_output, original)
+    relative_error = torch.linalg.vector_norm(
+        actual_model_output.float() - original.float()
+    ) / (torch.linalg.vector_norm(original.float()))
     assert relative_error < 0.05
 
 

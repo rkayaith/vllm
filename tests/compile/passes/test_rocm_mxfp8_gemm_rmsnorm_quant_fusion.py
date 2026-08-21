@@ -223,13 +223,11 @@ def test_fusion_replaces_complete_chain() -> None:
         for user in reference.users
         if user.target == operator.getitem
     }
-    assert set(reference_outputs) == {0, 2}
+    assert set(reference_outputs) == {0, 1}
     assert reference_outputs[0].meta["val"].shape == (TOKENS, HIDDEN_SIZE)
-    assert reference.meta["val"][1].shape == (TOKENS, OUTPUT_SIZE)
-    assert reference_outputs[2].meta["val"].shape == (TOKENS, OUTPUT_SIZE)
+    assert reference_outputs[1].meta["val"].shape == (TOKENS, OUTPUT_SIZE)
     assert reference_outputs[0].meta["val"].dtype == torch.bfloat16
-    assert reference.meta["val"][1].dtype == torch.float32
-    assert reference_outputs[2].meta["val"].dtype == torch.bfloat16
+    assert reference_outputs[1].meta["val"].dtype == torch.bfloat16
 
 
 def test_fusion_allows_independently_used_gemm0() -> None:
@@ -279,26 +277,36 @@ def test_reference_uses_fp32_gemm1(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(coda_fusion, "MXFP8_QUANT_OP", fake_quant)
 
     inputs = _example_inputs(tokens=1, device="cpu")
-    residual, transformed, model_output = (
-        coda_fusion.rocm_mxfp8_gemm_rmsnorm_gemm_reference(
-            inputs[0].to(torch.float8_e4m3fn),
-            torch.zeros(32, 8, dtype=torch.uint8),
-            inputs[1],
-            inputs[2],
-            inputs[3],
-            inputs[4],
-            QWEN3_EPSILON,
-            inputs[5],
-            inputs[6],
-            torch.bfloat16,
-            torch.bfloat16,
-        )
+    residual, model_output = coda_fusion.rocm_mxfp8_gemm_rmsnorm_gemm_reference(
+        inputs[0].to(torch.float8_e4m3fn),
+        torch.zeros(32, 8, dtype=torch.uint8),
+        inputs[1],
+        inputs[2],
+        inputs[3],
+        inputs[4],
+        QWEN3_EPSILON,
+        inputs[5],
+        inputs[6],
+        torch.bfloat16,
+        torch.bfloat16,
     )
 
     assert calls == [torch.bfloat16, torch.float32]
     assert residual.dtype == torch.bfloat16
-    assert transformed.dtype == torch.float32
     assert model_output.dtype == torch.bfloat16
+
+
+def test_fusion_errors_if_eligible_chain_remains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph_module = _trace_chain()
+    monkeypatch.setattr(coda_fusion, "_replace_outputs", lambda graph, match: None)
+
+    with pytest.raises(
+        AssertionError,
+        match="left eligible chains after rewriting:.*'mxfp8': 1",
+    ):
+        _run_fusion(graph_module.graph)
 
 
 def test_reference_consumes_gfx950_scale_layout(
@@ -505,7 +513,7 @@ def test_reference_op_is_bitwise_equal_to_fp32_gemm1_ordering(tokens: int) -> No
     expected = expected_gemm1 * inverse_rms
 
     with torch.no_grad():
-        actual_residual, actual, actual_model_output = MXFP8_REFERENCE_OP(
+        actual_residual, actual_model_output = MXFP8_REFERENCE_OP(
             input,
             input_scale,
             gemm0_weight,
@@ -520,9 +528,6 @@ def test_reference_op_is_bitwise_equal_to_fp32_gemm1_ordering(tokens: int) -> No
         )
     torch.cuda.synchronize()
 
-    assert actual.dtype == torch.float32
     assert actual_model_output.dtype == torch.bfloat16
     assert torch.equal(actual_residual, expected_residual)
-    assert torch.equal(actual, expected)
     assert torch.equal(actual_model_output, expected.to(torch.bfloat16))
-    assert not torch.equal(actual, expected.to(torch.bfloat16).float())

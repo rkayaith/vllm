@@ -54,7 +54,7 @@ def rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference(
     gemm0_use_triton: bool,
     gemm0_output_dtype: torch.dtype,
     gemm1_output_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute the delayed-rounding Qwen3-32B block-FP8 CoDA candidate."""
     gemm0_op = (
         BLOCK_FP8_PREFILL_GEMM_OP if gemm0_use_triton else BLOCK_FP8_DECODE_GEMM_OP
@@ -83,9 +83,8 @@ def rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference(
         gemm1_weight_scale,
         torch.float32,
     )
-    transformed_gemm1 = gemm1 * inverse_rms
-    model_gemm1 = transformed_gemm1.to(gemm1_output_dtype)
-    return updated_residual, transformed_gemm1, model_gemm1
+    model_gemm1 = (gemm1 * inverse_rms).to(gemm1_output_dtype)
+    return updated_residual, model_gemm1
 
 
 def _quantize_fp8_tile_activation(
@@ -128,7 +127,7 @@ def rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference_fake(
     gemm0_use_triton: bool,
     gemm0_output_dtype: torch.dtype,
     gemm1_output_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     return _fake_reference_outputs(input, residual, gemm1_weight, gemm1_output_dtype)
 
 
@@ -154,7 +153,7 @@ def rocm_mxfp8_gemm_rmsnorm_gemm_reference(
     gemm1_weight_scale: torch.Tensor,
     gemm0_output_dtype: torch.dtype,
     gemm1_output_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute the Qwen3-32B candidate with gfx950-shuffled MXFP8 scales."""
     gemm0 = MXFP8_GEMM_OP(
         input,
@@ -176,9 +175,8 @@ def rocm_mxfp8_gemm_rmsnorm_gemm_reference(
         gemm1_weight_scale,
         torch.float32,
     )
-    transformed_gemm1 = gemm1 * inverse_rms
-    model_gemm1 = transformed_gemm1.to(gemm1_output_dtype)
-    return updated_residual, transformed_gemm1, model_gemm1
+    model_gemm1 = (gemm1 * inverse_rms).to(gemm1_output_dtype)
+    return updated_residual, model_gemm1
 
 
 def rocm_mxfp8_gemm_rmsnorm_gemm_reference_fake(
@@ -193,7 +191,7 @@ def rocm_mxfp8_gemm_rmsnorm_gemm_reference_fake(
     gemm1_weight_scale: torch.Tensor,
     gemm0_output_dtype: torch.dtype,
     gemm1_output_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     del input_scale
     return _fake_reference_outputs(input, residual, gemm1_weight, gemm1_output_dtype)
 
@@ -213,11 +211,10 @@ def _fake_reference_outputs(
     residual: torch.Tensor,
     gemm1_weight: torch.Tensor,
     gemm1_output_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     output_shape = (input.shape[0], gemm1_weight.shape[0])
     return (
         torch.empty_like(residual),
-        torch.empty(output_shape, dtype=torch.float32, device=input.device),
         torch.empty(output_shape, dtype=gemm1_output_dtype, device=input.device),
     )
 
@@ -326,6 +323,18 @@ class RocmCodaGemmRMSNormGemmFusionPass(VllmInductorPass):
 
         VllmPatternMatcherPass.match_table[self.pass_name] += self.matched_count
         graph.eliminate_dead_code()
+        remaining_count_by_format = {
+            format_spec.name: 0 for format_spec in CODA_FORMATS
+        }
+        for node in graph.nodes:
+            match = _match_qwen3_coda_chain(node)
+            if match is not None:
+                remaining_count_by_format[match.format.name] += 1
+        if any(remaining_count_by_format.values()):
+            raise AssertionError(
+                f"{PASS_NAME} left eligible chains after rewriting: "
+                f"{remaining_count_by_format}"
+            )
         graph.lint()
 
 
@@ -443,15 +452,11 @@ def _replace_outputs(graph: fx.Graph, match: _CodaFusionMatch) -> None:
             args=_reference_args(match),
         )
         updated_residual = graph.call_function(operator.getitem, args=(fused, 0))
-        model_gemm1 = graph.call_function(operator.getitem, args=(fused, 2))
+        model_gemm1 = graph.call_function(operator.getitem, args=(fused, 1))
 
-    transformed_meta = dict(match.gemm1.meta)
-    if "val" in transformed_meta:
-        transformed_meta["val"] = transformed_meta["val"].float()
-    if "val" in match.residual.meta and "val" in transformed_meta:
+    if "val" in match.residual.meta and "val" in match.gemm1.meta:
         fused.meta["val"] = (
             match.residual.meta["val"],
-            transformed_meta["val"],
             match.gemm1.meta["val"],
         )
     updated_residual.meta.update(match.residual.meta)
