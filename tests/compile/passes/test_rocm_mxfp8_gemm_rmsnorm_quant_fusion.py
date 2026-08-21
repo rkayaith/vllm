@@ -30,13 +30,16 @@ from vllm.compilation.passes.fusion.rocm_coda_gemm_rmsnorm_gemm_fusion import (
     QWEN3_EPSILON,
     RocmCodaGemmRMSNormGemmFusionPass,
 )
-from vllm.config import CompilationConfig, CompilationMode, DeviceConfig, VllmConfig
-from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (
-    _mxfp8_dot_scaled_linear,
-    _rocm_mxfp8_dot_scaled_mm_impl,
+from vllm.config import (
+    CompilationConfig,
+    CompilationMode,
+    DeviceConfig,
+    KernelConfig,
+    VllmConfig,
 )
-from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-    mxfp8_e4m3_quantize,
+from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (
+    _mxfp8_dot_scaled_linear_gfx950,
+    _rocm_mxfp8_dot_scaled_mm_gfx950_impl,
 )
 from vllm.platforms import current_platform
 
@@ -48,8 +51,7 @@ MXFP8_BLOCK_SIZE = 32
 
 
 def _qwen3_mxfp8_chain(
-    input: torch.Tensor,
-    input_scale: torch.Tensor,
+    input_bf16: torch.Tensor,
     gemm0_weight: torch.Tensor,
     gemm0_weight_scale: torch.Tensor,
     residual: torch.Tensor,
@@ -59,12 +61,11 @@ def _qwen3_mxfp8_chain(
     *,
     epsilon: float = QWEN3_EPSILON,
     variance_size: int | None = None,
-    is_sf_swizzled_layout: bool = False,
-    alignment: int = 0,
     gemm0_output_dtype: torch.dtype = torch.bfloat16,
     gemm1_output_dtype: torch.dtype = torch.bfloat16,
     extra_output: str | None = None,
 ) -> tuple[torch.Tensor, ...]:
+    input, input_scale = MXFP8_QUANT_OP(input_bf16)
     gemm0 = MXFP8_GEMM_OP(
         input,
         input_scale,
@@ -79,11 +80,7 @@ def _qwen3_mxfp8_chain(
         epsilon,
         variance_size,
     )
-    quantized, quantized_scale = MXFP8_QUANT_OP(
-        normalized,
-        is_sf_swizzled_layout,
-        alignment,
-    )
+    quantized, quantized_scale = MXFP8_QUANT_OP(normalized)
     gemm1 = MXFP8_GEMM_OP(
         quantized,
         quantized_scale,
@@ -94,6 +91,8 @@ def _qwen3_mxfp8_chain(
 
     outputs = (residual_out, gemm1)
     extra_outputs = {
+        "input_quantized": input,
+        "input_scale": input_scale,
         "gemm0": gemm0,
         "normalized": normalized,
         "quantized": quantized,
@@ -110,13 +109,7 @@ def _example_inputs(
     device: str = "cuda",
 ) -> list[torch.Tensor]:
     return [
-        torch.empty(tokens, INPUT_SIZE, dtype=torch.float8_e4m3fn, device=device),
-        torch.empty(
-            tokens,
-            INPUT_SIZE // MXFP8_BLOCK_SIZE,
-            dtype=torch.uint8,
-            device=device,
-        ),
+        torch.empty(tokens, INPUT_SIZE, dtype=torch.bfloat16, device=device),
         torch.empty(
             HIDDEN_SIZE,
             INPUT_SIZE,
@@ -150,8 +143,6 @@ def _trace_chain(
     *,
     epsilon: float = QWEN3_EPSILON,
     variance_size: int | None = None,
-    is_sf_swizzled_layout: bool = False,
-    alignment: int = 0,
     gemm0_output_dtype: torch.dtype = torch.bfloat16,
     gemm1_output_dtype: torch.dtype = torch.bfloat16,
     extra_output: str | None = None,
@@ -161,8 +152,6 @@ def _trace_chain(
             *args,
             epsilon=epsilon,
             variance_size=variance_size,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            alignment=alignment,
             gemm0_output_dtype=gemm0_output_dtype,
             gemm1_output_dtype=gemm1_output_dtype,
             extra_output=extra_output,
@@ -175,6 +164,7 @@ def _run_fusion(graph: fx.Graph) -> RocmCodaGemmRMSNormGemmFusionPass:
     vllm_config = VllmConfig(
         compilation_config=CompilationConfig(mode=CompilationMode.VLLM_COMPILE),
         device_config=DeviceConfig(device=torch.device("cuda")),
+        kernel_config=KernelConfig(use_hipbmm_fused_epilogue=True),
     )
     with vllm.config.set_current_vllm_config(vllm_config):
         fusion_pass = RocmCodaGemmRMSNormGemmFusionPass(vllm_config)
@@ -188,6 +178,12 @@ def _nodes_with_target(graph: fx.Graph, target: object) -> list[fx.Node]:
 
 def test_fusion_replaces_complete_chain() -> None:
     graph_module = _trace_chain()
+    original_quants = _nodes_with_target(graph_module.graph, MXFP8_QUANT_OP)
+    assert len(original_quants) == 2
+    input_quant = original_quants[0]
+    input_quantized, input_scale = tuple(input_quant.users)
+    if input_quantized.args[1] != 0:
+        input_quantized, input_scale = input_scale, input_quantized
     original_gemms = _nodes_with_target(graph_module.graph, MXFP8_GEMM_OP)
     assert len(original_gemms) == 2
     gemm0, gemm1 = original_gemms
@@ -206,13 +202,13 @@ def test_fusion_replaces_complete_chain() -> None:
     assert len(references) == 1
     assert not _nodes_with_target(graph_module.graph, MXFP8_GEMM_OP)
     assert not _nodes_with_target(graph_module.graph, FUSED_ADD_RMS_NORM_OP)
-    assert not _nodes_with_target(graph_module.graph, MXFP8_QUANT_OP)
+    assert _nodes_with_target(graph_module.graph, MXFP8_QUANT_OP) == [input_quant]
 
     reference = references[0]
     assert reference.args == (
-        gemm0_args[0],
+        input_quantized,
+        input_scale,
         gemm0_args[2],
-        gemm0_args[1],
         gemm0_args[3],
         residual,
         rms_weight,
@@ -269,16 +265,12 @@ def test_reference_uses_fp32_gemm1(monkeypatch: pytest.MonkeyPatch) -> None:
 
     def fake_quant(
         input: torch.Tensor,
-        is_sf_swizzled_layout: bool,
-        alignment: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert not is_sf_swizzled_layout
-        assert alignment == 0
         return (
             input.to(torch.float8_e4m3fn),
             torch.zeros(
-                input.shape[0],
-                input.shape[1] // MXFP8_BLOCK_SIZE,
+                (input.shape[0] + 31) // 32 * 32,
+                (input.shape[1] // MXFP8_BLOCK_SIZE + 7) // 8 * 8,
                 dtype=torch.uint8,
             ),
         )
@@ -289,15 +281,15 @@ def test_reference_uses_fp32_gemm1(monkeypatch: pytest.MonkeyPatch) -> None:
     inputs = _example_inputs(tokens=1, device="cpu")
     residual, transformed, model_output = (
         coda_fusion.rocm_mxfp8_gemm_rmsnorm_gemm_reference(
-            inputs[0],
-            inputs[2],
+            inputs[0].to(torch.float8_e4m3fn),
+            torch.zeros(32, 8, dtype=torch.uint8),
             inputs[1],
+            inputs[2],
             inputs[3],
             inputs[4],
-            inputs[5],
             QWEN3_EPSILON,
+            inputs[5],
             inputs[6],
-            inputs[7],
             torch.bfloat16,
             torch.bfloat16,
         )
@@ -309,24 +301,72 @@ def test_reference_uses_fp32_gemm1(monkeypatch: pytest.MonkeyPatch) -> None:
     assert model_output.dtype == torch.bfloat16
 
 
+def test_reference_consumes_gfx950_scale_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gemm_calls: list[tuple[torch.Tensor, torch.Tensor, torch.dtype]] = []
+    produced_scale = torch.full((32, 8), 23, dtype=torch.uint8)
+
+    def fake_gemm(
+        input: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        gemm_calls.append((input_scale, weight_scale, output_dtype))
+        return torch.zeros(
+            input.shape[0],
+            weight.shape[0],
+            dtype=output_dtype,
+            device=input.device,
+        )
+
+    def fake_quant(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return input.to(torch.float8_e4m3fn), produced_scale
+
+    monkeypatch.setattr(coda_fusion, "MXFP8_GEMM_OP", fake_gemm)
+    monkeypatch.setattr(coda_fusion, "MXFP8_QUANT_OP", fake_quant)
+
+    inputs = _example_inputs(tokens=1, device="cpu")
+    input_scale = torch.full((32, 8), 11, dtype=torch.uint8)
+    gemm0_weight_scale = torch.full((256, 8), 13, dtype=torch.uint8)
+    gemm1_weight_scale = torch.full((384, 8), 17, dtype=torch.uint8)
+    coda_fusion.rocm_mxfp8_gemm_rmsnorm_gemm_reference(
+        inputs[0].to(torch.float8_e4m3fn),
+        input_scale,
+        inputs[1],
+        gemm0_weight_scale,
+        inputs[3],
+        inputs[4],
+        QWEN3_EPSILON,
+        inputs[5],
+        gemm1_weight_scale,
+        torch.bfloat16,
+        torch.bfloat16,
+    )
+
+    assert len(gemm_calls) == 2
+    assert gemm_calls[0][0] is input_scale
+    assert gemm_calls[0][1] is gemm0_weight_scale
+    assert gemm_calls[0][2] == torch.bfloat16
+    assert gemm_calls[1][0] is produced_scale
+    assert gemm_calls[1][1] is gemm1_weight_scale
+    assert gemm_calls[1][2] == torch.float32
+
+
 @pytest.mark.parametrize(
     (
         "epsilon",
         "variance_size",
-        "is_sf_swizzled_layout",
-        "alignment",
         "gemm0_output_dtype",
         "gemm1_output_dtype",
     ),
     [
-        pytest.param(
-            1e-5, None, False, 0, torch.bfloat16, torch.bfloat16, id="epsilon"
-        ),
+        pytest.param(1e-5, None, torch.bfloat16, torch.bfloat16, id="epsilon"),
         pytest.param(
             QWEN3_EPSILON,
             128,
-            False,
-            0,
             torch.bfloat16,
             torch.bfloat16,
             id="variance-size",
@@ -334,26 +374,6 @@ def test_reference_uses_fp32_gemm1(monkeypatch: pytest.MonkeyPatch) -> None:
         pytest.param(
             QWEN3_EPSILON,
             None,
-            True,
-            0,
-            torch.bfloat16,
-            torch.bfloat16,
-            id="swizzled-scales",
-        ),
-        pytest.param(
-            QWEN3_EPSILON,
-            None,
-            False,
-            32,
-            torch.bfloat16,
-            torch.bfloat16,
-            id="aligned-scales",
-        ),
-        pytest.param(
-            QWEN3_EPSILON,
-            None,
-            False,
-            0,
             torch.float16,
             torch.bfloat16,
             id="gemm0-output",
@@ -361,8 +381,6 @@ def test_reference_uses_fp32_gemm1(monkeypatch: pytest.MonkeyPatch) -> None:
         pytest.param(
             QWEN3_EPSILON,
             None,
-            False,
-            0,
             torch.bfloat16,
             torch.float16,
             id="gemm1-output",
@@ -372,16 +390,12 @@ def test_reference_uses_fp32_gemm1(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_fusion_rejects_non_qwen3_mxfp8_constants(
     epsilon: float,
     variance_size: int | None,
-    is_sf_swizzled_layout: bool,
-    alignment: int,
     gemm0_output_dtype: torch.dtype,
     gemm1_output_dtype: torch.dtype,
 ) -> None:
     graph_module = _trace_chain(
         epsilon=epsilon,
         variance_size=variance_size,
-        is_sf_swizzled_layout=is_sf_swizzled_layout,
-        alignment=alignment,
         gemm0_output_dtype=gemm0_output_dtype,
         gemm1_output_dtype=gemm1_output_dtype,
     )
@@ -402,6 +416,19 @@ def test_fusion_rejects_independently_used_intermediate(extra_output: str) -> No
     assert len(_nodes_with_target(graph_module.graph, MXFP8_GEMM_OP)) == 2
 
 
+@pytest.mark.parametrize("extra_output", ["input_quantized", "input_scale"])
+def test_fusion_rejects_independently_used_input_quantization(
+    extra_output: str,
+) -> None:
+    graph_module = _trace_chain(extra_output=extra_output)
+    fusion_pass = _run_fusion(graph_module.graph)
+
+    assert fusion_pass.matched_count == 0
+    assert not _nodes_with_target(graph_module.graph, MXFP8_REFERENCE_OP)
+    assert len(_nodes_with_target(graph_module.graph, MXFP8_QUANT_OP)) == 2
+    assert len(_nodes_with_target(graph_module.graph, MXFP8_GEMM_OP)) == 2
+
+
 @pytest.mark.skipif(
     not (current_platform.is_rocm() and current_platform.supports_mx()),
     reason="The native MXFP8 GEMM requires a ROCm gfx95x GPU",
@@ -417,10 +444,10 @@ def test_graph_visible_mxfp8_gemm_matches_direct_triton_path(
     weight_bf16 = torch.randn(
         HIDDEN_SIZE, INPUT_SIZE, dtype=torch.bfloat16, device="cuda"
     )
-    input, input_scale = mxfp8_e4m3_quantize(input_bf16)
-    weight, weight_scale = mxfp8_e4m3_quantize(weight_bf16)
+    input, input_scale = MXFP8_QUANT_OP(input_bf16)
+    weight, weight_scale = MXFP8_QUANT_OP(weight_bf16)
 
-    expected = _rocm_mxfp8_dot_scaled_mm_impl(
+    expected = _rocm_mxfp8_dot_scaled_mm_gfx950_impl(
         input, input_scale, weight, weight_scale, output_dtype
     )
     actual = MXFP8_GEMM_OP(input, input_scale, weight, weight_scale, output_dtype)
@@ -428,7 +455,9 @@ def test_graph_visible_mxfp8_gemm_matches_direct_triton_path(
 
     assert torch.equal(actual, expected)
     if output_dtype == torch.bfloat16:
-        linear_output = _mxfp8_dot_scaled_linear(input_bf16, weight, weight_scale)
+        linear_output = _mxfp8_dot_scaled_linear_gfx950(
+            input_bf16, weight, weight_scale
+        )
         assert torch.equal(linear_output, expected)
 
 
@@ -446,9 +475,9 @@ def test_reference_op_is_bitwise_equal_to_fp32_gemm1_ordering(tokens: int) -> No
     gemm1_weight_bf16 = torch.randn(
         OUTPUT_SIZE, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
     )
-    input, input_scale = MXFP8_QUANT_OP(input_bf16, False, 0)
-    gemm0_weight, gemm0_weight_scale = MXFP8_QUANT_OP(gemm0_weight_bf16, False, 0)
-    gemm1_weight, gemm1_weight_scale = MXFP8_QUANT_OP(gemm1_weight_bf16, False, 0)
+    input, input_scale = MXFP8_QUANT_OP(input_bf16)
+    gemm0_weight, gemm0_weight_scale = MXFP8_QUANT_OP(gemm0_weight_bf16)
+    gemm1_weight, gemm1_weight_scale = MXFP8_QUANT_OP(gemm1_weight_bf16)
     residual = torch.randn(tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
     rms_weight = (
         torch.randn(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.02 + 1.0
@@ -465,9 +494,7 @@ def test_reference_op_is_bitwise_equal_to_fp32_gemm1_ordering(tokens: int) -> No
     inverse_rms = torch.rsqrt(
         expected_residual.float().pow(2).mean(dim=-1, keepdim=True) + QWEN3_EPSILON
     )
-    quantized, quantized_scale = MXFP8_QUANT_OP(
-        expected_residual * rms_weight, False, 0
-    )
+    quantized, quantized_scale = MXFP8_QUANT_OP(expected_residual * rms_weight)
     expected_gemm1 = MXFP8_GEMM_OP(
         quantized,
         quantized_scale,
@@ -480,8 +507,8 @@ def test_reference_op_is_bitwise_equal_to_fp32_gemm1_ordering(tokens: int) -> No
     with torch.no_grad():
         actual_residual, actual, actual_model_output = MXFP8_REFERENCE_OP(
             input,
-            gemm0_weight,
             input_scale,
+            gemm0_weight,
             gemm0_weight_scale,
             residual,
             rms_weight,

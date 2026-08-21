@@ -28,10 +28,10 @@ BLOCK_FP8_DECODE_GEMM_OP_PACKET = torch.ops.vllm.rocm_aiter_gemm_a8w8_blockscale
 BLOCK_FP8_QUANT_OP = torch.ops.vllm.rocm_aiter_group_fp8_quant.default
 BLOCK_FP8_QUANT_OP_PACKET = torch.ops.vllm.rocm_aiter_group_fp8_quant
 FUSED_ADD_RMS_NORM_OP = torch.ops.vllm_ir.fused_add_rms_norm.default
-MXFP8_GEMM_OP = torch.ops.vllm.rocm_mxfp8_dot_scaled_mm.default
-MXFP8_GEMM_OP_PACKET = torch.ops.vllm.rocm_mxfp8_dot_scaled_mm
-MXFP8_QUANT_OP = torch.ops.vllm.mxfp8_quantize.default
-MXFP8_QUANT_OP_PACKET = torch.ops.vllm.mxfp8_quantize
+MXFP8_GEMM_OP = torch.ops.vllm.rocm_mxfp8_dot_scaled_mm_gfx950.default
+MXFP8_GEMM_OP_PACKET = torch.ops.vllm.rocm_mxfp8_dot_scaled_mm_gfx950
+MXFP8_QUANT_OP = torch.ops.vllm.rocm_aiter_mxfp8_quantize_gfx950.default
+MXFP8_QUANT_OP_PACKET = torch.ops.vllm.rocm_aiter_mxfp8_quantize_gfx950
 
 BLOCK_FP8_REFERENCE_OP_NAME = "rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference"
 MXFP8_REFERENCE_OP_NAME = "rocm_mxfp8_gemm_rmsnorm_gemm_reference"
@@ -144,8 +144,8 @@ BLOCK_FP8_REFERENCE_OP: OpOverload = getattr(
 
 def rocm_mxfp8_gemm_rmsnorm_gemm_reference(
     input: torch.Tensor,
-    gemm0_weight: torch.Tensor,
     input_scale: torch.Tensor,
+    gemm0_weight: torch.Tensor,
     gemm0_weight_scale: torch.Tensor,
     residual: torch.Tensor,
     rms_weight: torch.Tensor,
@@ -155,7 +155,7 @@ def rocm_mxfp8_gemm_rmsnorm_gemm_reference(
     gemm0_output_dtype: torch.dtype,
     gemm1_output_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute the delayed-rounding Qwen3-32B MXFP8 CoDA candidate."""
+    """Compute the Qwen3-32B candidate with gfx950-shuffled MXFP8 scales."""
     gemm0 = MXFP8_GEMM_OP(
         input,
         input_scale,
@@ -168,7 +168,7 @@ def rocm_mxfp8_gemm_rmsnorm_gemm_reference(
         updated_residual.float().pow(2).mean(dim=-1, keepdim=True) + epsilon
     )
     weighted = updated_residual * rms_weight
-    quantized, quantized_scale = MXFP8_QUANT_OP(weighted, False, 0)
+    quantized, quantized_scale = MXFP8_QUANT_OP(weighted)
     gemm1 = MXFP8_GEMM_OP(
         quantized,
         quantized_scale,
@@ -183,8 +183,8 @@ def rocm_mxfp8_gemm_rmsnorm_gemm_reference(
 
 def rocm_mxfp8_gemm_rmsnorm_gemm_reference_fake(
     input: torch.Tensor,
-    gemm0_weight: torch.Tensor,
     input_scale: torch.Tensor,
+    gemm0_weight: torch.Tensor,
     gemm0_weight_scale: torch.Tensor,
     residual: torch.Tensor,
     rms_weight: torch.Tensor,
@@ -194,6 +194,7 @@ def rocm_mxfp8_gemm_rmsnorm_gemm_reference_fake(
     gemm0_output_dtype: torch.dtype,
     gemm1_output_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del input_scale
     return _fake_reference_outputs(input, residual, gemm1_weight, gemm1_output_dtype)
 
 
@@ -271,6 +272,9 @@ class _CodaFusionMatch:
     quantized: fx.Node
     quantized_scale: fx.Node
     gemm1: fx.Node
+    input_quant: fx.Node | None = None
+    input_quantized: fx.Node | None = None
+    input_quantized_scale: fx.Node | None = None
 
 
 class RocmCodaGemmRMSNormGemmFusionPass(VllmInductorPass):
@@ -370,6 +374,37 @@ def _match_qwen3_coda_chain(gemm1: fx.Node) -> _CodaFusionMatch | None:
     ):
         return None
 
+    input_quant = None
+    input_quantized = None
+    input_quantized_scale = None
+    if format_spec == MXFP8_FORMAT:
+        input_quantized = gemm0.args[0]
+        input_quantized_scale = gemm0.args[format_spec.input_scale_index]
+        if not (
+            isinstance(input_quantized, fx.Node)
+            and is_func(input_quantized, operator.getitem)
+            and input_quantized.args[1] == 0
+            and isinstance(input_quantized_scale, fx.Node)
+            and is_func(input_quantized_scale, operator.getitem)
+            and input_quantized_scale.args[1] == 1
+        ):
+            return None
+
+        input_quant = input_quantized.args[0]
+        if not (
+            isinstance(input_quant, fx.Node)
+            and input_quantized_scale.args[0] is input_quant
+            and _is_qwen3_quant(input_quant, format_spec)
+        ):
+            return None
+
+        if set(input_quantized.users) != {gemm0}:
+            return None
+        if set(input_quantized_scale.users) != {gemm0}:
+            return None
+        if set(input_quant.users) != {input_quantized, input_quantized_scale}:
+            return None
+
     residual = find_getitem_maybe(rmsnorm, 1)
     if residual is None or not residual.users:
         return None
@@ -395,6 +430,9 @@ def _match_qwen3_coda_chain(gemm1: fx.Node) -> _CodaFusionMatch | None:
         quantized=quantized,
         quantized_scale=quantized_scale,
         gemm1=gemm1,
+        input_quant=input_quant,
+        input_quantized=input_quantized,
+        input_quantized_scale=input_quantized_scale,
     )
 
 
@@ -427,11 +465,7 @@ def _reference_args(match: _CodaFusionMatch) -> tuple[Argument, ...]:
     format_spec = match.format
     gemm0 = match.gemm0
     gemm1 = match.gemm1
-    common_args = (
-        gemm0.args[0],
-        gemm0.args[format_spec.weight_index],
-        gemm0.args[format_spec.input_scale_index],
-        gemm0.args[format_spec.weight_scale_index],
+    norm_args = (
         match.rmsnorm.args[1],
         match.rmsnorm.args[2],
         match.rmsnorm.args[3],
@@ -443,13 +477,28 @@ def _reference_args(match: _CodaFusionMatch) -> tuple[Argument, ...]:
     output_args = (gemm0.args[4], gemm1.args[4])
     if format_spec == BLOCK_FP8_FORMAT:
         return (
-            *common_args,
+            gemm0.args[0],
+            gemm0.args[format_spec.weight_index],
+            gemm0.args[format_spec.input_scale_index],
+            gemm0.args[format_spec.weight_scale_index],
+            *norm_args,
             match.quant.args[1],
             *gemm1_args,
             _uses_block_fp8_triton_gemm(gemm0),
             *output_args,
         )
-    return (*common_args, *gemm1_args, *output_args)
+    assert match.input_quant is not None
+    assert match.input_quantized is not None
+    assert match.input_quantized_scale is not None
+    return (
+        match.input_quantized,
+        match.input_quantized_scale,
+        gemm0.args[format_spec.weight_index],
+        gemm0.args[format_spec.weight_scale_index],
+        *norm_args,
+        *gemm1_args,
+        *output_args,
+    )
 
 
 def _format_for_gemm(node: fx.Node) -> _CodaFormat | None:
@@ -494,15 +543,7 @@ def _is_qwen3_quant(node: fx.Node, format_spec: _CodaFormat) -> bool:
             and isinstance(node.args[1], int)
             and node.args[1] == QWEN3_GROUP_SIZE
         )
-    is_sf_swizzled_layout = _quant_is_sf_swizzled_layout(node)
-    alignment = _quant_alignment(node)
-    return (
-        len(node.args) in {1, 2, 3}
-        and isinstance(is_sf_swizzled_layout, bool)
-        and not is_sf_swizzled_layout
-        and isinstance(alignment, int)
-        and alignment == 0
-    )
+    return len(node.args) == 1
 
 
 def _uses_block_fp8_triton_gemm(node: fx.Node) -> bool:
@@ -514,11 +555,3 @@ def _uses_block_fp8_triton_gemm(node: fx.Node) -> bool:
 
 def _rmsnorm_variance_size(node: fx.Node) -> Argument:
     return node.args[4] if len(node.args) == 5 else None
-
-
-def _quant_is_sf_swizzled_layout(node: fx.Node) -> Argument:
-    return node.args[1] if len(node.args) >= 2 else False
-
-
-def _quant_alignment(node: fx.Node) -> Argument:
-    return node.args[2] if len(node.args) == 3 else 0
