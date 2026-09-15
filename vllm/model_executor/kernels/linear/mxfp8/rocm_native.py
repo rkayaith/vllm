@@ -222,15 +222,34 @@ def _rocm_mxfp8_dot_scaled_mm_fake(
 def _rocm_aiter_mxfp8_quantize_gfx950_impl(
     input: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from aiter.ops.gemm_rmsnorm_gemm import quantize_mxfp8_gfx950
+    from aiter.ops.quant import dynamic_per_group_scaled_quant
 
-    return quantize_mxfp8_gfx950(input)
+    output, scale = _allocate_mxfp8_quantize_gfx950_outputs(input)
+    dynamic_per_group_scaled_quant(
+        output,
+        input,
+        scale,
+        group_size=MXFP8_BLOCK_SIZE,
+        shuffle_scale=True,
+    )
+    return output, scale
 
 
 def _rocm_aiter_mxfp8_quantize_gfx950_fake(
     input: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    return _allocate_mxfp8_quantize_gfx950_outputs(input)
+
+
+def _allocate_mxfp8_quantize_gfx950_outputs(
+    input: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     rows, columns = input.shape
+    assert input.dtype in {
+        torch.float16,
+        torch.bfloat16,
+    }, f"input dtype must be float16 or bfloat16, got {input.dtype}"
+    assert columns % 256 == 0, f"input columns must be divisible by 256, got {columns}"
     padded_rows = (rows + 31) // 32 * 32
     scale_columns = (columns // MXFP8_BLOCK_SIZE + 7) // 8 * 8
     return (

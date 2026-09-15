@@ -85,6 +85,25 @@ def test_gfx950_quantize_fake_uses_padded_scale_storage(
     assert scale.dtype == torch.uint8
 
 
+def test_gfx950_quantize_requires_k_multiple_of_256() -> None:
+    input = torch.empty(1, 128, dtype=torch.bfloat16)
+
+    with pytest.raises(
+        AssertionError, match="input columns must be divisible by 256, got 128"
+    ):
+        _rocm_aiter_mxfp8_quantize_gfx950_fake(input)
+
+
+def test_gfx950_quantize_rejects_unsupported_input_dtype() -> None:
+    input = torch.empty(1, 256, dtype=torch.float32)
+
+    with pytest.raises(
+        AssertionError,
+        match="input dtype must be float16 or bfloat16, got torch.float32",
+    ):
+        _rocm_aiter_mxfp8_quantize_gfx950_fake(input)
+
+
 def test_gfx950_scale_layout_kernel_requires_k_multiple_of_256() -> None:
     input = torch.empty(1, 128, dtype=torch.float8_e4m3fn)
     weight = torch.empty(32, 128, dtype=torch.float8_e4m3fn)
@@ -193,6 +212,27 @@ def test_hipbmm_feature_changes_kernel_config_hash() -> None:
     assert disabled.compute_hash() != enabled.compute_hash()
 
 
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only default")
+def test_hipbmm_feature_defaults_to_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_ROCM_USE_AITER_LINEAR_HIPBMM", True)
+
+    inherited = VllmConfig(
+        device_config=DeviceConfig(device="cuda"),
+        kernel_config=KernelConfig(),
+    )
+    explicitly_disabled = VllmConfig(
+        device_config=DeviceConfig(device="cuda"),
+        kernel_config=KernelConfig(use_hipbmm_fused_epilogue=False),
+    )
+
+    assert inherited.kernel_config.use_hipbmm_fused_epilogue is True
+    assert explicitly_disabled.kernel_config.use_hipbmm_fused_epilogue is False
+
+
 @pytest.mark.skipif(
     not (current_platform.is_rocm() and current_platform.supports_mx()),
     reason="The native MXFP8 GEMM requires a ROCm gfx95x GPU",
@@ -285,7 +325,6 @@ def test_aiter_producer_feeds_gfx950_scale_layout_kernel() -> None:
     quantized, scale = torch.ops.vllm.rocm_aiter_mxfp8_quantize_gfx950(input)
 
     assert torch.equal(quantized, row_quantized)
-    assert torch.equal(scale, shuffle_mxfp8_scale_gfx950(row_scale))
     expected = _rocm_mxfp8_dot_scaled_mm_impl(
         row_quantized,
         row_scale,

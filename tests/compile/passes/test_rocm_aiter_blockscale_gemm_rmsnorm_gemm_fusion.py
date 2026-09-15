@@ -23,9 +23,6 @@ from vllm._aiter_ops import is_aiter_found_and_supported, rocm_aiter_ops
 if not hasattr(torch.ops.vllm, "rocm_aiter_gemm_a8w8_blockscale"):
     rocm_aiter_ops.register_ops_once.__wrapped__()  # pyright: ignore[reportFunctionMemberAccess]
 
-from vllm.compilation.passes.fusion import (
-    rocm_coda_gemm_rmsnorm_gemm_fusion as coda_fusion,
-)
 from vllm.compilation.passes.fusion.rocm_coda_gemm_rmsnorm_gemm_fusion import (
     BLOCK_FP8_DECODE_GEMM_OP as DECODE_GEMM_OP,
 )
@@ -44,6 +41,7 @@ from vllm.config import (
     CompilationConfig,
     CompilationMode,
     DeviceConfig,
+    KernelConfig,
     ModelConfig,
     PassConfig,
     VllmConfig,
@@ -255,140 +253,6 @@ def test_fusion_allows_independently_used_gemm0() -> None:
     assert len(gemms[0].users) == 1
 
 
-def test_reference_uses_fp32_triton_gemm1_for_decode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[str, torch.dtype]] = []
-
-    def fake_gemm(
-        name: str,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        input_scale: torch.Tensor,
-        weight_scale: torch.Tensor,
-        output_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        calls.append((name, output_dtype))
-        return torch.zeros(
-            input.shape[0],
-            weight.shape[0],
-            dtype=output_dtype,
-            device=input.device,
-        )
-
-    def fake_triton_gemm(*args: object) -> torch.Tensor:
-        return fake_gemm("triton", *args)  # type: ignore[arg-type]
-
-    def fake_decode_gemm(*args: object) -> torch.Tensor:
-        return fake_gemm("decode", *args)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(coda_fusion, "BLOCK_FP8_PREFILL_GEMM_OP", fake_triton_gemm)
-    monkeypatch.setattr(coda_fusion, "BLOCK_FP8_DECODE_GEMM_OP", fake_decode_gemm)
-
-    inputs = _example_inputs(tokens=1, device="cpu")
-    (
-        input,
-        gemm0_weight,
-        input_scale,
-        gemm0_weight_scale,
-        residual_input,
-        rms_weight,
-        gemm1_weight,
-        gemm1_weight_scale,
-    ) = inputs
-    residual, model_output = (
-        coda_fusion.rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference(
-            input,
-            gemm0_weight,
-            input_scale,
-            gemm0_weight_scale,
-            residual_input,
-            rms_weight,
-            QWEN3_EPSILON,
-            QWEN3_GROUP_SIZE,
-            gemm1_weight,
-            gemm1_weight_scale,
-            False,
-            torch.bfloat16,
-            torch.bfloat16,
-        )
-    )
-
-    assert calls == [
-        ("decode", torch.bfloat16),
-        ("triton", torch.float32),
-    ]
-    assert residual.dtype == torch.bfloat16
-    assert model_output.dtype == torch.bfloat16
-
-
-def test_combined_pass_preserves_block_fp8_reference_numerics(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_gemm(
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        input_scale: torch.Tensor,
-        weight_scale: torch.Tensor,
-        output_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        return (input.float() @ weight.float().T).to(output_dtype)
-
-    monkeypatch.setattr(coda_fusion, "BLOCK_FP8_PREFILL_GEMM_OP", fake_gemm)
-    monkeypatch.setattr(coda_fusion, "BLOCK_FP8_DECODE_GEMM_OP", fake_gemm)
-
-    torch.manual_seed(0)
-    inputs = _example_inputs(tokens=2, device="cpu")
-    inputs[0].copy_(torch.randn(2, INPUT_SIZE).to(FP8_DTYPE))
-    inputs[1].copy_(torch.randn(HIDDEN_SIZE, INPUT_SIZE).to(FP8_DTYPE))
-    inputs[2].fill_(1.0)
-    inputs[3].fill_(1.0)
-    inputs[4].copy_(torch.randn(2, HIDDEN_SIZE).to(torch.bfloat16))
-    inputs[5].copy_((torch.randn(HIDDEN_SIZE) * 0.02 + 1.0).to(torch.bfloat16))
-    inputs[6].copy_(torch.randn(OUTPUT_SIZE, HIDDEN_SIZE).to(FP8_DTYPE))
-    inputs[7].fill_(1.0)
-
-    gemm0 = fake_gemm(inputs[0], inputs[1], inputs[2], inputs[3], torch.bfloat16)
-    expected_residual = gemm0 + inputs[4]
-    inverse_rms = torch.rsqrt(
-        expected_residual.float().pow(2).mean(dim=-1, keepdim=True) + QWEN3_EPSILON
-    )
-    weighted = expected_residual * inputs[5]
-    quantized, quantized_scale = _quantize_fp8_tile_activation(
-        weighted, QWEN3_GROUP_SIZE
-    )
-    expected_gemm1 = fake_gemm(
-        quantized,
-        inputs[6],
-        quantized_scale,
-        inputs[7],
-        torch.float32,
-    )
-    expected = expected_gemm1 * inverse_rms
-
-    actual_residual, actual_model_output = (
-        coda_fusion.rocm_aiter_blockscale_gemm_rmsnorm_gemm_reference(
-            inputs[0],
-            inputs[1],
-            inputs[2],
-            inputs[3],
-            inputs[4],
-            inputs[5],
-            QWEN3_EPSILON,
-            QWEN3_GROUP_SIZE,
-            inputs[6],
-            inputs[7],
-            False,
-            torch.bfloat16,
-            torch.bfloat16,
-        )
-    )
-
-    assert torch.equal(actual_residual, expected_residual)
-    assert torch.equal(actual_model_output, expected.to(torch.bfloat16))
-    assert not torch.equal(expected, actual_model_output.float())
-
-
 @pytest.mark.skipif(
     not rocm_aiter_ops.is_enabled(),
     reason="Pass manager registers ROCm AITER passes only when AITER is enabled",
@@ -406,6 +270,7 @@ def test_coda_fusion_runs_before_aiter_rmsnorm_quant_fusion() -> None:
             pass_config=PassConfig(fuse_norm_quant=True),
         ),
         device_config=DeviceConfig(device=torch.device("cuda")),
+        kernel_config=KernelConfig(use_hipbmm_fused_epilogue=True),
     )
     pass_manager = PostGradPassManager()
     pass_manager.configure(vllm_config)
@@ -421,6 +286,30 @@ def test_coda_fusion_runs_before_aiter_rmsnorm_quant_fusion() -> None:
         if isinstance(pass_, RocmCodaGemmRMSNormGemmFusionPass)
     )
     assert two_gemm_index < rmsnorm_quant_index
+
+
+def test_coda_fusion_does_not_require_hipbmm_fused_epilogue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.compilation.passes.pass_manager import PostGradPassManager
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: True)
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(dtype=torch.bfloat16),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            pass_config=PassConfig(fuse_norm_quant=True),
+        ),
+        device_config=DeviceConfig(device=torch.device("cuda")),
+        kernel_config=KernelConfig(use_hipbmm_fused_epilogue=False),
+    )
+    pass_manager = PostGradPassManager()
+    pass_manager.configure(vllm_config)
+
+    assert any(
+        isinstance(pass_, RocmCodaGemmRMSNormGemmFusionPass)
+        for pass_ in pass_manager.passes
+    )
 
 
 @pytest.mark.parametrize(

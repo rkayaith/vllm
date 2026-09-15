@@ -181,8 +181,11 @@ class KernelConfig:
     enable_bf16x3_router_gemm: bool = False
     """If True, use the experimental SM100 BF16x3 CuteDSL router GEMM."""
 
-    use_hipbmm_fused_epilogue: bool = False
-    """Select the ROCm MXFP8 layout required by the hipbmm fused epilogue."""
+    use_hipbmm_fused_epilogue: bool | None = None
+    """Enable ROCm hipBLASLt fused GEMM epilogues.
+
+    Defaults to ``VLLM_ROCM_USE_AITER_LINEAR_HIPBMM`` on ROCm.
+    """
 
     moe_backend: MoEBackend = "auto"
     """Backend for MoE expert computation kernels. Available options:
@@ -275,6 +278,14 @@ class KernelConfig:
     def set_platform_defaults(self, vllm_config: "VllmConfig") -> None:
         """Set platform-specific defaults for the kernel config."""
         from vllm.platforms import current_platform
+
+        if self.use_hipbmm_fused_epilogue is None:
+            if current_platform.is_rocm():
+                from vllm import envs
+
+                self.use_hipbmm_fused_epilogue = envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
+            else:
+                self.use_hipbmm_fused_epilogue = False
 
         platform_op_priority = current_platform.get_default_ir_op_priority(vllm_config)
         logger.debug(
