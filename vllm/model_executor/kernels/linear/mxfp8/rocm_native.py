@@ -94,19 +94,21 @@ def _mxfp8_linear_kernel(
     x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
     w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
     if SCALES_GFX950:
-        tl.static_assert(BLOCK_K % 256 == 0)
-        xs_ptrs = xs_ptr + _gfx950_scale_offset(
-            offs_m[:, None], offs_sk[None, :], K // 32
-        )
-        ws_ptrs = ws_ptr + _gfx950_scale_offset(
-            offs_n[:, None], offs_sk[None, :], K // 32
-        )
+        tl.static_assert(BLOCK_K % 128 == 0)
     else:
         xs_ptrs = xs_ptr + offs_m[:, None] * stride_xsm + offs_sk[None, :] * stride_xsk
         ws_ptrs = ws_ptr + offs_n[:, None] * stride_wsn + offs_sk[None, :] * stride_wsk
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for _ in range(0, tl.cdiv(K, BLOCK_K)):
+    for k_block in range(0, tl.cdiv(K, BLOCK_K)):
+        if SCALES_GFX950:
+            scale_columns = k_block * (BLOCK_K // 32) + offs_sk
+            xs_ptrs = xs_ptr + _gfx950_scale_offset(
+                offs_m[:, None], scale_columns[None, :], stride_xsm
+            )
+            ws_ptrs = ws_ptr + _gfx950_scale_offset(
+                offs_n[:, None], scale_columns[None, :], stride_wsn
+            )
         x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
         w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0)
         xs = tl.load(xs_ptrs, mask=m_mask[:, None], other=0)
@@ -114,10 +116,7 @@ def _mxfp8_linear_kernel(
         acc += tl.dot_scaled(x, xs, "e4m3", w.T, ws, "e4m3")
         x_ptrs += BLOCK_K * stride_xk
         w_ptrs += BLOCK_K * stride_wk
-        if SCALES_GFX950:
-            xs_ptrs += BLOCK_K
-            ws_ptrs += BLOCK_K
-        else:
+        if not SCALES_GFX950:
             xs_ptrs += (BLOCK_K // 32) * stride_xsk
             ws_ptrs += (BLOCK_K // 32) * stride_wsk
 
@@ -148,7 +147,7 @@ def _rocm_mxfp8_dot_scaled_mm_gfx950_impl(
 ) -> torch.Tensor:
     M, K = x.shape
     N = w.shape[0]
-    assert K % 256 == 0, f"input columns must be divisible by 256, got {K}"
+    assert K % 128 == 0, f"input columns must be divisible by 128, got {K}"
     expected_scale_columns = (K // MXFP8_BLOCK_SIZE + 7) // 8 * 8
     assert x_scale.shape == ((M + 31) // 32 * 32, expected_scale_columns)
     assert w_scale.shape == ((N + 31) // 32 * 32, expected_scale_columns)
@@ -249,7 +248,7 @@ def _allocate_mxfp8_quantize_gfx950_outputs(
         torch.float16,
         torch.bfloat16,
     }, f"input dtype must be float16 or bfloat16, got {input.dtype}"
-    assert columns % 256 == 0, f"input columns must be divisible by 256, got {columns}"
+    assert columns % 128 == 0, f"input columns must be divisible by 128, got {columns}"
     padded_rows = (rows + 31) // 32 * 32
     scale_columns = (columns // MXFP8_BLOCK_SIZE + 7) // 8 * 8
     return (
@@ -445,7 +444,7 @@ class RocmHipbmmMxfp8LinearKernel(RocmDotScaledMxfp8LinearKernel):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.data
         N, K = weight.shape
-        assert K % 256 == 0, f"weight columns must be divisible by 256, got {K}"
+        assert K % 128 == 0, f"weight columns must be divisible by 128, got {K}"
         scale_k = K // MXFP8_BLOCK_SIZE
         weight_scale = layer.weight_scale.data[:N, :scale_k].contiguous()
         layer.weight = Parameter(weight.contiguous(), requires_grad=False)
@@ -464,8 +463,8 @@ class RocmHipbmmMxfp8LinearKernel(RocmDotScaledMxfp8LinearKernel):
                 f"Expected {MXFP8_SCALE_DTYPE} weight_scale, got "
                 f"{layer.weight_scale.dtype}."
             )
-        assert x.shape[-1] % 256 == 0, (
-            f"input columns must be divisible by 256, got {x.shape[-1]}"
+        assert x.shape[-1] % 128 == 0, (
+            f"input columns must be divisible by 128, got {x.shape[-1]}"
         )
         out_shape = (*x.shape[:-1], layer.weight.shape[0])
         x2d = x.reshape(-1, x.shape[-1])

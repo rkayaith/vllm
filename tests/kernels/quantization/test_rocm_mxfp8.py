@@ -68,7 +68,12 @@ def test_shuffle_mxfp8_scale_gfx950_exact_layout(rows: int, columns: int) -> Non
 
 @pytest.mark.parametrize(
     ("rows", "columns", "expected_scale_shape"),
-    [(1, 256, (32, 8)), (33, 256, (64, 8)), (33, 512, (64, 16))],
+    [
+        (1, 256, (32, 8)),
+        (33, 256, (64, 8)),
+        (33, 512, (64, 16)),
+        (33, 29568, (64, 928)),
+    ],
 )
 def test_gfx950_quantize_fake_uses_padded_scale_storage(
     rows: int,
@@ -85,11 +90,11 @@ def test_gfx950_quantize_fake_uses_padded_scale_storage(
     assert scale.dtype == torch.uint8
 
 
-def test_gfx950_quantize_requires_k_multiple_of_256() -> None:
-    input = torch.empty(1, 128, dtype=torch.bfloat16)
+def test_gfx950_quantize_requires_k_multiple_of_128() -> None:
+    input = torch.empty(1, 64, dtype=torch.bfloat16)
 
     with pytest.raises(
-        AssertionError, match="input columns must be divisible by 256, got 128"
+        AssertionError, match="input columns must be divisible by 128, got 64"
     ):
         _rocm_aiter_mxfp8_quantize_gfx950_fake(input)
 
@@ -104,14 +109,14 @@ def test_gfx950_quantize_rejects_unsupported_input_dtype() -> None:
         _rocm_aiter_mxfp8_quantize_gfx950_fake(input)
 
 
-def test_gfx950_scale_layout_kernel_requires_k_multiple_of_256() -> None:
-    input = torch.empty(1, 128, dtype=torch.float8_e4m3fn)
-    weight = torch.empty(32, 128, dtype=torch.float8_e4m3fn)
+def test_gfx950_scale_layout_kernel_requires_k_multiple_of_128() -> None:
+    input = torch.empty(1, 64, dtype=torch.float8_e4m3fn)
+    weight = torch.empty(32, 64, dtype=torch.float8_e4m3fn)
     input_scale = torch.empty(32, 8, dtype=torch.uint8)
     weight_scale = torch.empty(32, 8, dtype=torch.uint8)
 
     with pytest.raises(
-        AssertionError, match="input columns must be divisible by 256, got 128"
+        AssertionError, match="input columns must be divisible by 128, got 64"
     ):
         _rocm_mxfp8_dot_scaled_mm_gfx950_impl(
             input,
@@ -122,9 +127,11 @@ def test_gfx950_scale_layout_kernel_requires_k_multiple_of_256() -> None:
         )
 
 
-def test_hipbmm_backend_replaces_weight_scale_with_gfx950_layout() -> None:
+@pytest.mark.parametrize("input_size", [512, 29568])
+def test_hipbmm_backend_replaces_weight_scale_with_gfx950_layout(
+    input_size: int,
+) -> None:
     output_size = 33
-    input_size = 512
     layer = torch.nn.Module()
     layer.weight = torch.nn.Parameter(
         torch.empty(output_size, input_size, dtype=torch.float8_e4m3fn),
@@ -143,7 +150,8 @@ def test_hipbmm_backend_replaces_weight_scale_with_gfx950_layout() -> None:
         layer.weight_scale,
         shuffle_mxfp8_scale_gfx950(row_major_scale),
     )
-    assert layer.weight_scale.shape == (64, 16)
+    expected_scale_columns = (input_size // 32 + 7) // 8 * 8
+    assert layer.weight_scale.shape == (64, expected_scale_columns)
     assert layer.weight_scale.is_contiguous()
 
 
@@ -282,6 +290,56 @@ def test_gfx950_scale_layout_kernel_matches_row_major(
     )
     torch.cuda.synchronize()
 
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() and current_platform.supports_mx()),
+    reason="The native MXFP8 GEMM requires a ROCm gfx95x GPU",
+)
+def test_gfx950_scale_layout_kernel_reads_final_128_value_tile() -> None:
+    tokens = 2
+    output_size = 32
+    input_size = 29568
+    torch.manual_seed(3)
+    input = torch.zeros(tokens, input_size, dtype=torch.float8_e4m3fn, device="cuda")
+    weight = torch.zeros(
+        output_size, input_size, dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    input[:, -128:] = torch.randn(tokens, 128, device="cuda").to(torch.float8_e4m3fn)
+    weight[:, -128:] = torch.randn(output_size, 128, device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    input_scale = torch.full(
+        (tokens, input_size // 32),
+        127,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    weight_scale = torch.full(
+        (output_size, input_size // 32),
+        127,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+    expected = _rocm_mxfp8_dot_scaled_mm_impl(
+        input,
+        input_scale,
+        weight,
+        weight_scale,
+        torch.bfloat16,
+    )
+    actual = _rocm_mxfp8_dot_scaled_mm_gfx950_impl(
+        input,
+        shuffle_mxfp8_scale_gfx950(input_scale),
+        weight,
+        shuffle_mxfp8_scale_gfx950(weight_scale),
+        torch.bfloat16,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.count_nonzero(expected) > 0
     assert torch.equal(actual, expected)
 
 
